@@ -7,6 +7,14 @@
 		"share": "مشاركة",
 		"done": "تم",
 		"open": "فتح",
+		"checkForUpdates": "التحقق من وجود تحديثات",
+		"updateSettings": "إعدادات التحديث",
+		"updateModeNotify": "إشعار عند توفر تحديث",
+		"updateModeDownload": "تنزيل التحديثات تلقائيًا",
+		"updateModeDownloadAndInstall": "تنزيل التحديثات وتثبيتها تلقائيًا",
+		"viewRelease": "عرض الإصدار",
+		"downloadUpdate": "تنزيل التحديث",
+		"restartNow": "إعادة التشغيل الآن",
 		"upload": "رفع",
 		"export": "تصدير",
 		"showInFolder": "عرض في المجلد",
@@ -14,6 +22,7 @@
 		"edit": "تعديل",
 		"view": "عرض",
 		"window": "نافذة",
+		"help": "مساعدة",
 		"quit": "خروج",
 		"stopRecording": "إيقاف التسجيل",
 		"undo": "تراجع",
@@ -35,13 +44,18 @@
 		"services": "خدمات",
 		"hide": "إخفاء OpenScreen",
 		"hideOthers": "إخفاء الآخرين",
-		"unhide": "إظهار الكل"
+		"unhide": "إظهار الكل",
+		"saveDiagnostics": "حفظ التشخيصات"
 	},
-	"playback": {
-		"play": "تشغيل",
-		"pause": "ايقاف مؤقت",
-		"fullscreen": "ملء الشاشة",
-		"exitFullscreen": "خروج من ملء الشاشة"
+	"updates": {
+		"available": "يتوفر OpenScreen {{latestVersion}}. الإصدار المثبت هو {{currentVersion}}.",
+		"current": "OpenScreen محدّث ({{currentVersion}}).",
+		"readyToInstall": "تم تنزيل OpenScreen {{latestVersion}}. أعد التشغيل لإكمال التثبيت.",
+		"downloaded": "تم تنزيل OpenScreen {{latestVersion}}.",
+		"blockedRecording": "أنهِ التسجيل قبل تثبيت التحديث.",
+		"blockedLocation": "انقل OpenScreen إلى مجلد التطبيقات قبل التحديث.",
+		"failed": "تعذّر التحقق من وجود تحديثات.",
+		"downloadFailed": "تعذّر تنزيل التحديث."
 	},
 	"units": {
 		"pixelsPerSecond": "{{value}} بكسل/ثانية",

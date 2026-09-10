@@ -3,14 +3,17 @@ import {
 	Download,
 	FolderOpen,
 	FolderPlus,
+	Info,
+	Keyboard,
 	Languages,
 	Moon,
 	PanelLeft,
+	RefreshCw,
 	Save,
-	Settings,
+	Sparkles,
 	Sun,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
 import logoMark from "@/assets/openscreen-mark.png";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { useTheme } from "@/hooks/useTheme";
@@ -27,6 +30,9 @@ export interface TopBarActions {
 	openSettings: () => void;
 	renameProject: (title: string) => void;
 	toggleChat: () => void;
+	openProviderSettings: () => void;
+	showAbout: () => void;
+	checkForUpdates: () => void;
 }
 
 interface EditorTopBarProps {
@@ -82,11 +88,7 @@ export function EditorTopBar({
 					</>
 				) : null}
 			</span>
-			<span className={styles.brand}>
-				{/* Decorative: the wordmark right beside it already names the app. */}
-				<img src={logoMark} alt="" draggable={false} />
-				<span className={styles.name}>OpenScreen</span>
-			</span>
+			<AppMenu actions={actions} />
 			<span className={styles.sep} aria-hidden />
 			<ProjectNameField title={projectTitle} onRename={actions.renameProject} />
 			<span className={styles.sep} aria-hidden />
@@ -138,10 +140,10 @@ export function EditorTopBar({
 			    keeps the width of the longer label and the bar doesn't twitch every
 			    time the document goes dirty. The inactive one is visibility:hidden,
 			    which also takes it out of the accessibility tree. */}
-			<span className={styles.saved}>
+			<span className={styles.saved} title={dirty ? t("topbar.unsaved") : t("topbar.saved")}>
 				<span className={styles.savedState} data-on={!dirty}>
 					<span className={styles.dot} aria-hidden />
-					{t("topbar.saved")}
+					<span className={styles.savedLabel}>{t("topbar.saved")}</span>
 				</span>
 				<span className={styles.savedState} data-on={dirty}>
 					<span
@@ -149,7 +151,7 @@ export function EditorTopBar({
 						aria-hidden
 						style={{ background: "var(--warn)", boxShadow: "0 0 0 3px var(--warn-soft)" }}
 					/>
-					{t("topbar.unsaved")}
+					<span className={styles.savedLabel}>{t("topbar.unsaved")}</span>
 				</span>
 			</span>
 
@@ -160,6 +162,7 @@ export function EditorTopBar({
 						type="button"
 						role="tab"
 						aria-selected={mode === m.id}
+						title={t(m.labelKey)}
 						// Feeds the hidden bold copy that reserves the selected width — see
 						// .modeSwitch button::before.
 						data-label={t(m.labelKey)}
@@ -181,15 +184,6 @@ export function EditorTopBar({
 			</button>
 			<button
 				type="button"
-				className={styles.iconBtn}
-				title={t("topbar.settings")}
-				aria-label={t("topbar.settings")}
-				onClick={actions.openSettings}
-			>
-				<Settings size={16} />
-			</button>
-			<button
-				type="button"
 				className={styles.exportBtn}
 				title={t("topbar.export")}
 				aria-label={t("topbar.export")}
@@ -197,7 +191,7 @@ export function EditorTopBar({
 				disabled={!canExport}
 			>
 				<Download size={15} />
-				{t("topbar.export")}
+				<span className={styles.exportLabel}>{t("topbar.export")}</span>
 			</button>
 		</header>
 	);
@@ -262,6 +256,201 @@ function ProjectNameField({
 	);
 }
 
+/** The brand doubles as the application menu.
+ *
+ *  Windows and Linux have no visible menu bar to put About and the update check in: this bar
+ *  IS the titlebar (createEditorWindow passes titleBarStyle:"hidden"), and the native menu is
+ *  behind setAutoHideMenuBar(true) — so those two items were reachable only from the tray, or
+ *  by holding Alt, which is to say not reachable. Hanging them off the wordmark is what Figma,
+ *  Linear and Slack do under the same constraint.
+ *
+ *  It costs the bar no width, which is the reason it is the wordmark and not a new button:
+ *  .modeSwitch is the only flex-shrink:1 element in the topbar, so any control added here is
+ *  paid for out of the mode labels, in the most verbose of 13 locales, at the 800px minimum
+ *  window width.
+ *
+ *  No row invents a label. Each one reuses the key of the thing it opens: `common.actions.*`
+ *  for the rows electron/main.ts also builds native menu items from (About, Check for
+ *  Updates), and the dialog's own title key for the rows that open a dialog (`shortcuts.title`,
+ *  `editor.providerSettings.title`). That is what stops this menu from drifting away from the
+ *  native menu on one side and from what its rows actually open on the other — and it is why
+ *  this component adds no translation work. */
+/** Shared by the mount seed and the per-open refresh below. A rejection — no preload, browser
+ *  mode — resolves to "no", which hides the item rather than shipping a button whose click the
+ *  main process would refuse without saying so. */
+async function readUpdateVeto(cancelled: () => boolean, apply: (allowed: boolean) => void) {
+	try {
+		const allowed = await window.electronAPI?.canCheckForUpdatesNow?.();
+		if (!cancelled()) apply(allowed === true);
+	} catch {
+		if (!cancelled()) apply(false);
+	}
+}
+
+function AppMenu({ actions }: { actions: TopBarActions }) {
+	const tCommon = useScopedT("common");
+	const tEditor = useScopedT("editor");
+	const tShortcuts = useScopedT("shortcuts");
+	const [open, setOpen] = useState(false);
+	const [version, setVersion] = useState<string | null>(null);
+	const [canUpdate, setCanUpdate] = useState(false);
+	const ref = useRef<HTMLDivElement | null>(null);
+	const menuRef = useRef<HTMLDivElement | null>(null);
+	const triggerRef = useRef<HTMLButtonElement | null>(null);
+
+	// At mount: the version, which never changes while the process lives, and a first read of
+	// the update veto so the item does not pop in a frame late on the first open and shove the
+	// row under the pointer.
+	useEffect(() => {
+		let cancelled = false;
+		window.electronAPI
+			?.getAppInfo?.()
+			.then((info) => {
+				if (!cancelled) setVersion(info.version);
+			})
+			.catch(() => {
+				// Leaves the version off the About row. The row itself still works, and the tray
+				// and native menu still reach the same box, so there is nothing to report.
+			});
+		void readUpdateVeto(() => cancelled, setCanUpdate);
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+
+	// And again on every open, unlike the version: this answer includes the transient veto —
+	// no update check mid-take — so the seed above goes stale the moment a recording starts.
+	// A cached "yes" would offer a check that the main process then silently refuses.
+	useEffect(() => {
+		if (!open) return;
+		let cancelled = false;
+		void readUpdateVeto(() => cancelled, setCanUpdate);
+		return () => {
+			cancelled = true;
+		};
+	}, [open]);
+
+	useEffect(() => {
+		if (!open) return;
+		const onDocMouseDown = (e: MouseEvent) => {
+			if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+		};
+		document.addEventListener("mousedown", onDocMouseDown);
+		return () => document.removeEventListener("mousedown", onDocMouseDown);
+	}, [open]);
+
+	// Focus the first item as the menu appears, so it is operable from the keyboard without a
+	// Tab through the whole bar first.
+	useEffect(() => {
+		if (!open) return;
+		menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+	}, [open]);
+
+	const close = (restoreFocus: boolean) => {
+		setOpen(false);
+		// Escape and Tab-out hand focus back to the trigger; a click does not, because the
+		// pointer user did not come from there and a focus ring appearing under the cursor
+		// reads as a bug.
+		if (restoreFocus) triggerRef.current?.focus();
+	};
+
+	const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+		if (e.key === "Escape") {
+			e.preventDefault();
+			close(true);
+			return;
+		}
+		if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+		e.preventDefault();
+		const items = Array.from(
+			menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
+		);
+		if (items.length === 0) return;
+		const at = items.indexOf(document.activeElement as HTMLButtonElement);
+		const next = e.key === "ArrowDown" ? at + 1 : at - 1;
+		// Wraps both ways; `at` is -1 when focus escaped the list, and ArrowDown then lands on 0.
+		items[(next + items.length) % items.length]?.focus();
+	};
+
+	const run = (action: () => void) => () => {
+		close(false);
+		action();
+	};
+
+	return (
+		<div ref={ref} className={styles.appMenuAnchor}>
+			<button
+				ref={triggerRef}
+				type="button"
+				className={`${styles.brand} ${styles.brandBtn}`}
+				aria-haspopup="menu"
+				aria-expanded={open}
+				aria-label="OpenScreen"
+				title="OpenScreen"
+				onClick={() => setOpen((v) => !v)}
+			>
+				{/* Decorative: the wordmark beside it already names the app — and, being the
+				    button's only text, is also its accessible name. */}
+				<img src={logoMark} alt="" draggable={false} />
+				<span className={styles.name}>OpenScreen</span>
+				<ChevronDown size={13} className={styles.brandChevron} aria-hidden />
+			</button>
+			{open ? (
+				<div ref={menuRef} className={styles.appMenu} role="menu" onKeyDown={onMenuKeyDown}>
+					<button
+						type="button"
+						role="menuitem"
+						className={styles.appMenuRow}
+						onClick={run(actions.openSettings)}
+					>
+						<Keyboard size={15} />
+						{tShortcuts("title")}
+					</button>
+					{/* Settings surfaces together, above the separator. Both rows are labelled with the
+					    title of the dialog they open, so neither can drift from it — and unlike the AI
+					    panel's own entry points, this one is reachable in Media and Rec too, which is
+					    the whole reason the dialog's open state was lifted out of LeftPanel (#420). */}
+					<button
+						type="button"
+						role="menuitem"
+						className={styles.appMenuRow}
+						onClick={run(actions.openProviderSettings)}
+					>
+						<Sparkles size={15} />
+						{tEditor("providerSettings.title")}
+					</button>
+					<div className={styles.appMenuSep} aria-hidden />
+					{/* Only the PERMANENT half of the veto is applied here. A Store/Flathub/Snap/Nix
+					    copy never offers the check at all; the transient half — not during a take —
+					    stays with the main process, which re-checks it on the IPC, because this
+					    window is not the one that knows a recording is running. */}
+					{canUpdate ? (
+						<button
+							type="button"
+							role="menuitem"
+							className={styles.appMenuRow}
+							onClick={run(actions.checkForUpdates)}
+						>
+							<RefreshCw size={15} />
+							{tCommon("actions.checkForUpdates")}
+						</button>
+					) : null}
+					<button
+						type="button"
+						role="menuitem"
+						className={styles.appMenuRow}
+						onClick={run(actions.showAbout)}
+					>
+						<Info size={15} />
+						{tCommon("actions.about")}
+						{version ? <span className={styles.appMenuVersion}>{version}</span> : null}
+					</button>
+				</div>
+			) : null}
+		</div>
+	);
+}
+
 function LangButton() {
 	const { locale, setLocale } = useI18n();
 	const t = useScopedT("editor");
@@ -276,53 +465,29 @@ function LangButton() {
 		return () => document.removeEventListener("mousedown", onDocClick);
 	}, [open]);
 	return (
-		<div ref={ref} style={{ position: "relative", flexShrink: 0 }}>
+		<div ref={ref} className={styles.langAnchor}>
 			<button
 				type="button"
-				className={styles.iconBtn}
-				style={{ width: "auto", padding: "0 8px", gap: 6, display: "inline-flex" }}
+				className={`${styles.iconBtn} ${styles.langBtn}`}
 				onClick={() => setOpen((v) => !v)}
 				aria-label={t("topbar.changeLanguage")}
 				aria-pressed={open}
 			>
-				<Languages size={15} />
+				<Languages size={15} className={styles.langIcon} />
 				{/* Fixed-width, centred: the short labels run from "EN" to "PT-BR" to
 				    the CJK "简中", and letting the button size to them moved everything
 				    to its right on each language change. */}
 				<span className={styles.langShort}>{getLocaleShort(locale)}</span>
-				<ChevronDown size={9} style={{ color: "var(--muted)" }} />
+				<ChevronDown size={9} className={styles.langChevron} />
 			</button>
 			{open ? (
-				<div
-					style={{
-						position: "absolute",
-						top: "calc(100% + 4px)",
-						right: 0,
-						minWidth: 160,
-						background: "var(--surface)",
-						border: "1px solid var(--border)",
-						borderRadius: "var(--r-md)",
-						boxShadow: "var(--elev-pop)",
-						padding: 4,
-						zIndex: 60,
-					}}
-				>
+				<div className={styles.langMenu}>
 					{getAvailableLocales().map((code) => (
 						<button
 							key={code}
 							type="button"
-							style={{
-								display: "block",
-								width: "100%",
-								textAlign: "left",
-								padding: "6px 10px",
-								border: 0,
-								background: code === locale ? "var(--accent-wash)" : "transparent",
-								color: code === locale ? "var(--accent)" : "var(--fg-2)",
-								borderRadius: "var(--r-sm)",
-								cursor: "pointer",
-								font: "500 12px var(--font-body)",
-							}}
+							className={styles.langMenuItem}
+							data-active={code === locale}
 							onClick={() => {
 								setLocale(code);
 								setOpen(false);

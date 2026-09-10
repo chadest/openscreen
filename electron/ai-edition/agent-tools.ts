@@ -16,6 +16,12 @@
 // described are gone (see `MUTATING_TOOL_NAMES`).
 
 import { z } from "zod";
+import {
+	collapseTracksToPills,
+	patchAudioTrack,
+	placeAudioTrackInDocument,
+	trackGroupId,
+} from "../../src/lib/ai-edition/document/audioTracks";
 import { createId } from "../../src/lib/ai-edition/document/ids";
 import {
 	moveClip,
@@ -26,8 +32,10 @@ import {
 	replaceTimeline,
 	setClipSourceRange,
 } from "../../src/lib/ai-edition/document/timeline";
+import { setDocumentWordText } from "../../src/lib/ai-edition/document/transcript";
 import type { AxcutDocument } from "../../src/lib/ai-edition/schema";
 import { hasAnyClipWithCamera } from "../../src/lib/ai-edition/timeline/camera";
+import { isGeneratedAssetId } from "../../src/lib/ai-edition/timeline/clip-parts";
 import {
 	buildCursorTrack,
 	type CursorTrackSample,
@@ -38,6 +46,7 @@ import {
 	replacePillSpan,
 	resolvePillIds,
 } from "../../src/lib/ai-edition/timeline/timelineMap";
+import { trimAppliesToClip } from "../../src/lib/ai-edition/timeline/trim-mapping";
 // ponytail: relative, and it has to stay that way — `electron/` never resolves
 // the `@/` alias (the main-process build does not declare it), which is why the
 // scale table was moved out of `components/video-editor/types.ts` to be
@@ -336,6 +345,11 @@ function droppedByEdit(before: AxcutDocument, after: AxcutDocument) {
 // private — callers only ever need the composed `*Args`.)
 const secondsSchema = z.number().finite().nonnegative();
 
+/** Span given to an agent-placed audio track when the asset has no probed duration
+ *  yet. Short on purpose: a wrong guess the user has to lengthen beats one that
+ *  silently covers the whole programme. */
+const DEFAULT_AGENT_AUDIO_SEC = 10;
+
 export const addTrimArgs = z.object({
 	startSec: secondsSchema,
 	endSec: secondsSchema,
@@ -478,6 +492,26 @@ export const setAnnotationArgs = z.object({
 	text: z.string().optional(),
 });
 
+export const addAudioArgs = z.object({
+	assetId: z.string().min(1),
+	startSec: secondsSchema,
+	endSec: secondsSchema.optional(),
+	kind: z.enum(["voiceover", "music"]).default("music"),
+	offsetSec: secondsSchema.default(0),
+	gainDb: z.number().min(-60).max(12).default(0),
+});
+
+export const setAudioArgs = z.object({
+	audioId: z.string().min(1),
+	startSec: secondsSchema.optional(),
+	endSec: secondsSchema.optional(),
+	kind: z.enum(["voiceover", "music"]).optional(),
+	offsetSec: secondsSchema.optional(),
+	gainDb: z.number().min(-60).max(12).optional(),
+	muted: z.boolean().optional(),
+	loop: z.boolean().optional(),
+});
+
 export const addCameraFullscreenArgs = z.object({
 	startSec: secondsSchema,
 	endSec: secondsSchema,
@@ -487,6 +521,18 @@ export const setCameraFullscreenArgs = z.object({
 	cameraFullscreenId: z.string().min(1),
 	startSec: secondsSchema.optional(),
 	endSec: secondsSchema.optional(),
+});
+
+export const getTranscriptWordsArgs = z.object({
+	assetId: z.string().min(1).optional(),
+	startSec: secondsSchema.optional(),
+	endSec: secondsSchema.optional(),
+});
+
+export const setWordTextArgs = z.object({
+	wordId: z.string().min(1),
+	text: z.string(),
+	assetId: z.string().min(1).optional(),
 });
 
 export const removeTrimArgs = z.object({
@@ -500,6 +546,84 @@ export const removeModifierArgs = z.object({
 export const removeClipArgs = z.object({
 	clipId: z.string().min(1),
 });
+
+/**
+ * Every tool the model is handed, in the order `buildTools` builds them.
+ *
+ * The roster lives here, beside `MUTATING_TOOL_NAMES`, rather than in
+ * `deep-agent/service.ts` where `buildTools` is: the workbench needs to name the
+ * surface from its L0 layer, and importing the service would drag LangChain into
+ * a layer that deliberately runs on zod and pure document helpers alone.
+ *
+ * It is hand-written — the schemas differ per tool, so nothing can generate it —
+ * but it is not free-floating: `deep-agent/service.test.ts` asserts it equals
+ * `buildTools(...).map(t => t.name)`, and that test runs in CI. Adding a tool
+ * without adding it here fails the suite.
+ *
+ * ponytail: there used to be two more copies of this list, one in that test and
+ * one in `workbench/lib/prompts.ts`, neither derived from anything. The
+ * workbench's copy sat at 19 entries from the day it was written while the agent
+ * grew to 21 (`addTrims`/`addZooms`, commit 560d368e). Nothing caught it,
+ * because `npm run wb` is not part of CI — so the bench asserted a surface the
+ * product had not had for some time.
+ */
+export const OPENSCREEN_TOOL_NAMES = [
+	"getCurrentDocument",
+	"getTranscript",
+	"getTranscriptWords",
+	"getCursorTrack",
+	"setWordText",
+	"addTrim",
+	"addTrims",
+	"setTrim",
+	"setClipRange",
+	"moveClip",
+	"replaceTimeline",
+	"addZoom",
+	"addZooms",
+	"setZoom",
+	"addSpeed",
+	"setSpeed",
+	"addAnnotation",
+	"setAnnotation",
+	"addCameraFullscreen",
+	"setCameraFullscreen",
+	"addAudio",
+	"setAudio",
+	"removeTrim",
+	"removeModifier",
+	"removeClip",
+] as const;
+
+/**
+ * The tools `createDeepAgent` used to inject on top of ours, over an in-memory
+ * backend that was EMPTY and that the model was not told was empty — the
+ * mechanical cause of D1, where the agent ran `ls`/`glob` against that sandbox
+ * and reported in good faith that the project held no cursor telemetry.
+ *
+ * The surface is gone, so this is no longer "tools we also get": it is the list
+ * of names that must never appear again. A call to one of them now means the
+ * model is hallucinating a filesystem it was never offered, which is a rarer but
+ * still exact D1 tell — which is why the workbench scores it as well as pinning
+ * it here.
+ *
+ * `execute` is included even though it vanished at runtime: it is in the
+ * middleware's list too and only disappeared because the default backend is not
+ * a sandbox. A sandbox backend would have made it a 26th tool. The workbench's
+ * own copy of this list omitted it, so `isPhantomTool` could not flag the one
+ * name a sandbox backend would have brought back.
+ */
+export const PHANTOM_TOOL_NAMES = [
+	"ls",
+	"read_file",
+	"write_file",
+	"edit_file",
+	"glob",
+	"grep",
+	"execute",
+	"write_todos",
+	"task",
+] as const;
 
 /**
  * The tools that change the document. A LIST, not an inference: it gates the
@@ -517,6 +641,9 @@ export const removeClipArgs = z.object({
  * remaining surfaces (descriptions, built tools, executor cases) to each other.
  */
 export const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
+	// Writes the transcript, not the timeline — but it writes the document, so it is a
+	// consented edit like any other.
+	"setWordText",
 	"addTrim",
 	"addTrims",
 	"addZooms",
@@ -532,6 +659,8 @@ export const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"setAnnotation",
 	"addCameraFullscreen",
 	"setCameraFullscreen",
+	"addAudio",
+	"setAudio",
 	"removeTrim",
 	"removeModifier",
 	"removeClip",
@@ -590,7 +719,9 @@ export function documentSnapshotForModel(
 	const autoFocusAll = legacy?.autoFocusAll === true;
 	return {
 		timeBaseNote:
-			"clips and trims are in source-time seconds; zooms, speedRegions, annotations and cameraFullscreenRegions are in virtual (edited-timeline) seconds.",
+			"clips and trims are in source-time seconds; zooms, speedRegions, annotations, cameraFullscreenRegions and audioTracks are in virtual (edited-timeline) seconds.",
+		audioNote:
+			"audioTracks are imported voiceover / music files laid over the recording. They are clip-anchored like every other region, so they travel with their clip through reorder and trim, and they play at 1x whatever a speed region does to the picture under them. addAudio places an EXISTING asset of kind 'audio'; nothing here can import a file from disk or record one, so if the project has no audio asset, say so rather than inventing an id.",
 		zoomNote:
 			`renderedScale is what the viewer sees (depth is an ordinal, not a factor: ${ZOOM_DEPTH_LEGEND}). ` +
 			"When a zoom carries customScale it wins over depth and depthIsOverridden is true — " +
@@ -608,6 +739,10 @@ export function documentSnapshotForModel(
 		assets: document.assets.map((a) => ({
 			id: a.id,
 			label: a.label,
+			// "audio" is an imported voiceover / music file: it is never a clip, it is
+			// played by an audio track. Without this the model sees an asset it cannot
+			// explain and tries to place it on the timeline as footage.
+			kind: a.kind,
 			durationSec: a.durationSec ?? null,
 			hasCameraTrack: a.cameraTrack != null,
 			cameraVisible: a.cameraTrack?.visible ?? false,
@@ -679,6 +814,22 @@ export function documentSnapshotForModel(
 			id: c.id,
 			startSec: roundSec(c.startMs),
 			endSec: roundSec(c.endMs),
+		})),
+		// Imported audio, collapsed to the pills the ruler draws — a track ventilated
+		// across a clip boundary is several fragments the user sees as one thing, and
+		// the model has to name what the user sees.
+		audioTracks: collapseTracksToPills(document.audioTracks).map((t) => ({
+			id: trackGroupId(t),
+			startSec: roundSec(t.startMs),
+			endSec: roundSec(t.endMs),
+			assetId: t.assetId,
+			// Which lane it sits on. Also decides whether it is transcribed at all.
+			kind: t.kind,
+			// Where in the FILE the track starts playing, in that file's own seconds.
+			offsetSec: roundSec(t.offsetMs),
+			gainDb: t.gainDb,
+			muted: t.muted,
+			loop: t.loop,
 		})),
 		hasTranscript: document.transcripts.length > 0 || document.transcript !== null,
 	};
@@ -858,6 +1009,146 @@ export function resolveCursorAssetId(
 	return assetId ?? document.project.primaryAssetId ?? document.assets[0]?.id ?? null;
 }
 
+// ─── What the pointer was doing where the zoom landed ──────────────────────
+//
+// ponytail: `focus` is the one thing a zoom write says that nothing ever
+// checked. A span covering no clip is refused, a depth outside the table is
+// refused, and the result reports the span that really landed — but a focus on
+// the pointer and a focus half a frame off it produced byte-identical results,
+// so a caller had no way to find out which of the two it had just written. The
+// result now carries where the pointer ACTUALLY was over the window the zoom
+// landed on, beside the focus the call used.
+//
+// It informs; it decides nothing. Framing a slide, a face, or a corner the
+// pointer never visits is a legitimate zoom: nothing is moved, nothing is
+// refused, and this is a measurement the caller is free to disagree with. The
+// only thing that changes is that the difference is on the page instead of
+// nowhere.
+
+/** Per-axis median, not the mean. A pointer that crosses the frame and comes
+ *  back averages to the middle of a path it spent no time on, while the median
+ *  lands where it actually sat. `spread` is what says whether either number
+ *  describes anything. */
+function medianOf(values: number[]): number {
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = sorted.length >> 1;
+	return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function round3(value: number): number {
+	return Math.round(value * 1000) / 1000;
+}
+
+/**
+ * Where the recorded pointer was over the span a zoom write LANDED on.
+ *
+ * A zoom is authored in VIRTUAL seconds and the pointer is recorded on the
+ * asset's SOURCE clock, so something has to map between them — and that map
+ * already exists, computed once by `anchorRawRegionsToClips`, which writes
+ * `sourceStartSec`/`sourceEndSec` onto every fragment as it ventilates a span
+ * across clips. So the source windows are read back OFF THE FRAGMENTS the write
+ * just stored, never re-derived from `timelineStartSec`. A second derivation
+ * would be free to drift, and it would drift on exactly the cases that make this
+ * report worth having: a CLAMPED span and a span SPLIT across two clips both
+ * land on source windows that are not the ones asked for, and both are already
+ * right in the anchors. A fragment whose clip draws on another asset contributes
+ * nothing — this telemetry does not describe that media.
+ *
+ * Absence is never a claim. The field is left OFF when the runtime holds no
+ * telemetry for the footage under the span, which covers "no reader wired",
+ * "this asset has no sidecar" and "the zoom landed on another asset's clip"
+ * alike; none of those is evidence about the recording, and the tool description
+ * says so. `available: false` is emitted only for the two things that ARE
+ * findings about this span: nothing was recorded over it, or everything recorded
+ * over it is cut out of playback.
+ */
+function cursorAnchorReport(
+	// `id` is not read; it is what makes this a fragment of a stored region rather
+	// than an all-optional bag TypeScript would let any object satisfy.
+	regions: Array<{ id: string; clipId?: string; sourceStartSec?: number; sourceEndSec?: number }>,
+	document: AxcutDocument,
+	focus: { cx: number; cy: number },
+	telemetry: CursorTelemetryContext | undefined,
+): Record<string, unknown> | undefined {
+	const load = telemetry?.load;
+	if (load?.status !== "ok") return undefined;
+	const byId = new Map(document.timeline.clips.map((c) => [c.id, c]));
+	const windows = regions.flatMap((region) => {
+		const clip = region.clipId ? byId.get(region.clipId) : undefined;
+		if (!clip || clip.assetId !== load.assetId) return [];
+		if (region.sourceStartSec === undefined || region.sourceEndSec === undefined) return [];
+		return [{ clip, startSec: region.sourceStartSec, endSec: region.sourceEndSec }];
+	});
+	if (windows.length === 0) return undefined;
+
+	const xs: number[] = [];
+	const ys: number[] = [];
+	let cutOut = 0;
+	for (const sample of load.samples) {
+		if (
+			!Number.isFinite(sample.timeMs) ||
+			!Number.isFinite(sample.cx) ||
+			!Number.isFinite(sample.cy)
+		) {
+			continue;
+		}
+		const atSec = sample.timeMs / 1000;
+		const covering = windows.find((w) => atSec >= w.startSec && atSec <= w.endSec);
+		if (!covering) continue;
+		// `trimAppliesToClip` is THE rule for "is this cut on this clip", and the
+		// fragment names its clip, so the question is answered exactly once here.
+		// A trimmed instant is one the viewer never reaches: a position argued from
+		// frames that do not play would be the same kind of untruth as a span that
+		// reports the edges it was asked for rather than the ones it got.
+		if (
+			document.timeline.trimRanges.some(
+				(t) => trimAppliesToClip(t, covering.clip) && atSec >= t.startSec && atSec <= t.endSec,
+			)
+		) {
+			cutOut += 1;
+			continue;
+		}
+		xs.push(sample.cx);
+		ys.push(sample.cy);
+	}
+
+	if (xs.length === 0) {
+		return cutOut > 0
+			? {
+					available: false,
+					reason: "trimmed-out",
+					note:
+						"The pointer WAS recorded over this span, but a trim cuts every one of those " +
+						"instants out of playback, so none of them describes what a viewer sees here.",
+				}
+			: {
+					available: false,
+					reason: "no-samples",
+					note:
+						"This recording's pointer telemetry covers no instant of this span. That is a " +
+						"fact about this span, not about the recording.",
+				};
+	}
+
+	const cx = medianOf(xs);
+	const cy = medianOf(ys);
+	let spread = 0;
+	for (let i = 0; i < xs.length; i += 1) {
+		spread = Math.max(spread, Math.hypot(xs[i] - cx, ys[i] - cy));
+	}
+	return {
+		available: true,
+		// Echoed, including the default a call that omitted `focus` silently got:
+		// "you asked for the centre" is the half of the comparison the caller
+		// cannot reconstruct from its own arguments.
+		focus: { cx: focus.cx, cy: focus.cy },
+		cursor: { cx: round3(cx), cy: round3(cy) },
+		offset: round3(Math.hypot(cx - focus.cx, cy - focus.cy)),
+		spread: round3(spread),
+		samples: xs.length,
+	};
+}
+
 export function executeAgentTool(
 	document: AxcutDocument,
 	name: string,
@@ -985,6 +1276,107 @@ export function executeAgentTool(
 			return {
 				ok: true,
 				resultJson: JSON.stringify({ assetId, language: transcript.language, segments }),
+			};
+		}
+
+		// The word-level read. `getTranscript` answers in SEGMENTS, whose ids belong to a
+		// different namespace than the words — so on its own it cannot address anything
+		// `setWordText` takes. This is the one that can. It is separate rather than folded
+		// in because a whole transcript is already ~70k tokens and most turns never touch a
+		// word; the span filter is there so fixing one name costs one phrase, not the film.
+		case "getTranscriptWords": {
+			const parsed = getTranscriptWordsArgs.safeParse(args);
+			if (!parsed.success) return failure(parsed.error.message);
+			const assetId =
+				parsed.data.assetId ?? document.project.primaryAssetId ?? document.assets[0]?.id;
+			const transcript =
+				document.transcripts.find((t) => t.assetId === assetId) ??
+				(document.transcript?.assetId === assetId ? document.transcript : null);
+			if (!transcript) {
+				return failure(`No transcript for asset ${assetId ?? "(none)"}.`);
+			}
+			const from = parsed.data.startSec ?? Number.NEGATIVE_INFINITY;
+			const to = parsed.data.endSec ?? Number.POSITIVE_INFINITY;
+			const words = transcript.words
+				.filter((word) => word.endSec >= from && word.startSec <= to)
+				.map((word) => ({
+					id: word.id,
+					text: word.text,
+					startSec: word.startSec,
+					endSec: word.endSec,
+					// Only the words that are NOT plain transcription say so, so the common
+					// case costs nothing to read.
+					...(word.source ? { source: word.source } : {}),
+					...(word.originalText !== undefined ? { originalText: word.originalText } : {}),
+				}));
+			return {
+				ok: true,
+				resultJson: JSON.stringify({
+					assetId,
+					language: transcript.language,
+					total: transcript.words.length,
+					returned: words.length,
+					words,
+				}),
+			};
+		}
+
+		// Correcting what the transcriber HEARD. This writes text and nothing else: the
+		// captions follow it, the film does not move. The tool for making a spoken word go
+		// away is addTrim, which removes its audio with it.
+		case "setWordText": {
+			const parsed = setWordTextArgs.safeParse(args);
+			if (!parsed.success) return failure(parsed.error.message);
+			const assetId =
+				parsed.data.assetId ?? document.project.primaryAssetId ?? document.assets[0]?.id;
+			if (!assetId) return failure("Project has no assets — nothing to correct.");
+			const { wordId, text } = parsed.data;
+			const transcript = document.transcripts.find((t) => t.assetId === assetId);
+			const before = transcript?.words.find((word) => word.id === wordId);
+			if (!before) {
+				return failure(
+					`No word ${wordId} in the transcript for asset ${assetId}. ` +
+						`Call getTranscriptWords to read the ids.`,
+				);
+			}
+			if (before.text === text) {
+				return failure(`Word ${wordId} already reads "${text}" — nothing to change.`);
+			}
+			// This tool exists to fix a name the transcriber misheard. An INSERTED word was
+			// never heard: retyping it resizes the clip it plays on and asks for generated
+			// media of a new length, which is the gesture the editor gates on `insertionsEnabled`
+			// — and that gate lives in the renderer, where the chat does not run. Refused here
+			// unconditionally rather than mirrored, because the agent has no business authoring
+			// generated media at all.
+			if (isGeneratedAssetId(assetId)) {
+				return failure(
+					`Word ${wordId} was added to the transcript, not heard — the chat cannot rewrite it.`,
+				);
+			}
+			let next: AxcutDocument;
+			try {
+				next = setDocumentWordText(document, assetId, wordId, text);
+			} catch (error) {
+				return failure(error instanceof Error ? error.message : String(error));
+			}
+			const after = next.transcripts
+				.find((t) => t.assetId === assetId)
+				?.words.find((word) => word.id === wordId);
+			return {
+				ok: true,
+				document: next,
+				resultJson: JSON.stringify({
+					wordId,
+					assetId,
+					text: after?.text ?? text,
+					was: before.text,
+					// Absent once the word is back to what the transcriber said — the pair is
+					// cleared on that round trip, and the model should be able to see it.
+					originalText: after?.originalText,
+					blanked: text.trim().length === 0,
+				}),
+				summary:
+					text.trim().length === 0 ? `blanked "${before.text}"` : `"${before.text}" → "${text}"`,
 			};
 		}
 
@@ -1274,6 +1666,10 @@ export function executeAgentTool(
 				...document,
 				zoomRanges: [...document.zoomRanges, ...placed] as AxcutDocument["zoomRanges"],
 			};
+			// Measured over what was STORED, never over what was asked for: `placed`
+			// is the clamped, ventilated truth, so the report cannot end up
+			// describing a window the zoom does not occupy.
+			const anchor = cursorAnchorReport(placed, document, zoom.focus, options?.cursorTelemetry);
 			return {
 				ok: true,
 				document: next,
@@ -1284,6 +1680,7 @@ export function executeAgentTool(
 					// model turns into "3×" for a frame that renders 1.80×.
 					renderedScale: effectiveZoomScale(zoom),
 					...landingReport(landing, startMs / 1000, endMs / 1000),
+					...(anchor ? { cursorAnchor: anchor } : {}),
 				}),
 				summary:
 					`added zoom ${formatSec(landing.startSec)} – ${formatSec(landing.endSec)} ` +
@@ -1345,6 +1742,18 @@ export function executeAgentTool(
 			// re-ventilated, and `renderedScale` is the only number the viewer sees.
 			const landed = new Set(landing.ids);
 			const strength = rebuiltZooms.find((z) => landed.has(z.id));
+			// The EFFECTIVE focus, read off the document exactly like `renderedScale`
+			// is: a setZoom that moved only the span still gets told what its
+			// untouched focus now looks at, which is most of the reason to reshape a
+			// zoom at all.
+			const anchor = strength
+				? cursorAnchorReport(
+						rebuiltZooms.filter((z) => landed.has(z.id)),
+						document,
+						strength.focus,
+						options?.cursorTelemetry,
+					)
+				: undefined;
 			return {
 				ok: true,
 				document: next,
@@ -1355,6 +1764,7 @@ export function executeAgentTool(
 						: {}),
 					...(clearsCustomScale ? { clearedCustomScale: true } : {}),
 					...landingReport(landing, startMs / 1000, endMs / 1000),
+					...(anchor ? { cursorAnchor: anchor } : {}),
 				}),
 				summary:
 					`updated zoom ${formatSec(landing.startSec)} – ${formatSec(landing.endSec)}` +
@@ -1610,6 +2020,165 @@ export function executeAgentTool(
 			};
 		}
 
+		case "addAudio": {
+			const parsed = addAudioArgs.safeParse(args);
+			if (!parsed.success) return failure(parsed.error.message);
+			const { assetId, kind, offsetSec, gainDb } = parsed.data;
+			const asset = document.assets.find((a) => a.id === assetId);
+			// Two distinct refusals, because they need two different corrections: an
+			// unknown id is a hallucinated asset, a video id is the model reaching for
+			// footage. Naming the audio the project HAS is what stops the retry loop.
+			if (!asset) {
+				const available = document.assets.filter((a) => a.kind === "audio");
+				return failure(
+					`Unknown asset: ${assetId}.` +
+						(available.length
+							? ` Imported audio in this project: ${available.map((a) => `${a.id} (${a.label})`).join(", ")}.`
+							: " This project has no imported audio; a file can only be imported or recorded from the editor, not from here."),
+				);
+			}
+			if (asset.kind !== "audio") {
+				return failure(
+					`Asset ${assetId} is video, not audio. addAudio plays an imported audio file over the recording; to place footage use replaceTimeline.`,
+				);
+			}
+			const durationSec = asset.durationSec ?? 0;
+			// "Start the file at offsetSec" is only answerable when there is file left
+			// there. Past the end it yields a track that plays silence, which the model
+			// then reports as having placed audio. Unknown duration is not a refusal: an
+			// import whose probe failed carries 0 until the renderer re-probes it.
+			if (durationSec > 0 && offsetSec >= durationSec) {
+				return failure(
+					`offsetSec ${offsetSec}s is at or past the end of ${assetId} (${durationSec}s), so the track would play nothing. Pick an offset inside the file.`,
+				);
+			}
+			// No endSec means "as long as the file is" — the natural span, and the one
+			// the editor's own add uses, so the model never has to compute it.
+			const startSec = parsed.data.startSec;
+			const endSec =
+				parsed.data.endSec ??
+				startSec + Math.max(0.1, (durationSec || DEFAULT_AGENT_AUDIO_SEC) - offsetSec);
+			const startMs = toMs(Math.min(startSec, endSec));
+			const endMs = toMs(Math.max(startSec, endSec));
+			const trackId = createId("audio");
+			const withTrack = placeAudioTrackInDocument(
+				document,
+				{
+					id: trackId,
+					trackId,
+					startMs,
+					endMs,
+					assetId,
+					kind,
+					durationSec,
+					offsetMs: toMs(offsetSec),
+					gainDb,
+					loop: false,
+					fadeInMs: 0,
+					fadeOutMs: 0,
+					muted: false,
+					label: asset.label,
+					origin: "agent",
+				} as AxcutDocument["audioTracks"][number],
+				() => createId("audio"),
+				"create",
+			);
+			if (withTrack === document) {
+				return coversNoClip("audio", startMs / 1000, endMs / 1000, document);
+			}
+			const placed = withTrack.audioTracks.filter((t) => trackGroupId(t) === trackId);
+			const next: AxcutDocument = withTrack;
+			const landing = landingOf(placed, document);
+			return {
+				ok: true,
+				document: next,
+				resultJson: JSON.stringify({
+					audioId: trackId,
+					...landingReport(landing, startMs / 1000, endMs / 1000),
+				}),
+				summary:
+					`added ${kind} "${asset.label}" ${formatSec(landing.startSec)} – ${formatSec(landing.endSec)}` +
+					landingSuffix(landing, startMs / 1000, endMs / 1000),
+			};
+		}
+
+		case "setAudio": {
+			const parsed = setAudioArgs.safeParse(args);
+			if (!parsed.success) return failure(parsed.error.message);
+			const { audioId } = parsed.data;
+			const pill = collapseTracksToPills(document.audioTracks).find(
+				(t) => trackGroupId(t) === audioId,
+			);
+			if (!pill) return failure(`Unknown audio track: ${audioId}`);
+
+			if (parsed.data.offsetSec !== undefined) {
+				const asset = document.assets.find((a) => a.id === pill.assetId);
+				const durationSec = asset?.durationSec ?? 0;
+				if (durationSec > 0 && parsed.data.offsetSec >= durationSec) {
+					return failure(
+						`offsetSec ${parsed.data.offsetSec}s is at or past the end of ${pill.assetId} (${durationSec}s), so the track would play nothing.`,
+					);
+				}
+			}
+
+			// Payload first, through the helper that keeps every fragment of the group in
+			// agreement — gain, mute, loop and the offset are all track-wide, and a patch
+			// that reached only one fragment would split the pill in two.
+			let next = patchAudioTrack(document, audioId, {
+				...(parsed.data.gainDb !== undefined ? { gainDb: parsed.data.gainDb } : {}),
+				...(parsed.data.muted !== undefined ? { muted: parsed.data.muted } : {}),
+				...(parsed.data.loop !== undefined ? { loop: parsed.data.loop } : {}),
+				...(parsed.data.offsetSec !== undefined ? { offsetMs: toMs(parsed.data.offsetSec) } : {}),
+			});
+
+			// A span or lane change re-anchors: drop the group and lay it down again, so
+			// the fragments are re-cut against the clips the new span covers rather than
+			// patched in place against the old ones.
+			const wantsRespan =
+				parsed.data.startSec !== undefined ||
+				parsed.data.endSec !== undefined ||
+				parsed.data.kind !== undefined;
+			if (wantsRespan) {
+				const current =
+					collapseTracksToPills(next.audioTracks).find((t) => trackGroupId(t) === audioId) ?? pill;
+				const { startMs, endMs } = resolveSpanMs(current, parsed.data.startSec, parsed.data.endSec);
+				// A `kind` flip re-clamps against the DESTINATION lane's neighbours, not the
+				// one it is leaving — moving a take onto the music row must respect what is
+				// already on the music row (issue #560).
+				const moved = placeAudioTrackInDocument(
+					next,
+					{
+						...current,
+						id: audioId,
+						trackId: audioId,
+						startMs,
+						endMs,
+						...(parsed.data.kind !== undefined ? { kind: parsed.data.kind } : {}),
+					},
+					() => createId("audio"),
+					"move",
+				);
+				if (moved === next) {
+					return coversNoClip("audio", startMs / 1000, endMs / 1000, document);
+				}
+				next = moved;
+			}
+
+			const after = collapseTracksToPills(next.audioTracks).find(
+				(t) => trackGroupId(t) === audioId,
+			);
+			return {
+				ok: true,
+				document: next,
+				resultJson: JSON.stringify({
+					audioId,
+					startSec: roundSec(after?.startMs ?? pill.startMs),
+					endSec: roundSec(after?.endMs ?? pill.endMs),
+				}),
+				summary: `updated audio ${audioId} ${formatSec(roundSec(after?.startMs ?? pill.startMs))} – ${formatSec(roundSec(after?.endMs ?? pill.endMs))}`,
+			};
+		}
+
 		case "removeTrim": {
 			const parsed = removeTrimArgs.safeParse(args);
 			if (!parsed.success) return failure(parsed.error.message);
@@ -1639,9 +2208,10 @@ export function executeAgentTool(
 			else if (document.annotations.some((a) => a.id === id)) kind = "annotation";
 			else if (speedRegions.some((s) => s.id === id)) kind = "speed";
 			else if (cameraFullscreenRegions.some((c) => c.id === id)) kind = "cameraFullscreen";
+			else if (document.audioTracks.some((t) => trackGroupId(t) === id)) kind = "audio";
 			if (!kind) {
 				return failure(
-					`No zoom / speed / annotation / full-camera modifier with id ${id}. ` +
+					`No zoom / speed / annotation / full-camera / audio modifier with id ${id}. ` +
 						`For a trim use removeTrim; for a clip use removeClip.`,
 				);
 			}

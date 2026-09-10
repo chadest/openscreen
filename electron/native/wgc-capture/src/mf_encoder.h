@@ -30,6 +30,17 @@ struct AudioInputFormat {
 struct MFEncoderOptions {
     bool preferSoftwareEncoder = false;
     bool injectDefaultSinkWriterFailureOnce = false;
+    // Test-only. Keep the sample rate passed into initialize() instead of
+    // running makeAacCompatibleAudioFormat again. OPENSCREEN_WGC_DISABLE_AAC_RATE_SNAP
+    // used to change only the JSON log: buildAacOutputType / configureAudioStream
+    // snapped 96 kHz back to 48 kHz before SetInputMediaType, so the fail path
+    // was unreachable.
+    bool skipAacRateSnap = false;
+    // Test-only. Before the production sink writer sees the audio type, run
+    // MFCreateSinkWriterFromURL + SetInputMediaType on the encoder rate. Illegal
+    // AAC rates fail that probe with MF_E_INVALIDMEDIATYPE (0xc00d36b4). Does
+    // not invent the HRESULT — it calls the API.
+    bool injectAacRateProbe = false;
     // A request, never a requirement. Every step of the GPU path degrades to
     // the CPU readback rather than failing the recording, so a machine without
     // a hardware H.264 encoder, without NV12 video-processor output, or with a
@@ -41,6 +52,28 @@ struct MFEncoderOptions {
 constexpr const char* kVideoEncoderSelectionDefault = "default";
 constexpr const char* kVideoEncoderSelectionSoftwarePreferred = "software-preferred";
 constexpr const char* kVideoEncoderSelectionSoftwareFallback = "software-fallback";
+
+// Whether BeginWriting() actually landed on a hardware-accelerated H.264 MFT.
+//
+// videoEncoderSelection() above says which *path* initialize() took --
+// whether the DXGI GPU pipeline was asked for, or software was forced -- but
+// none of those labels says what Media Foundation itself picked, and that
+// matters even now that createSinkWriter asks for hardware transforms on
+// every path but the forced-software one: MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS
+// asks, it does not guarantee -- a machine with no hardware H.264 MFT
+// registered, or one whose driver refuses it, still lands on software. That
+// gap is exactly what this exists to close for a bug report: "default" alone
+// cannot tell a real hardware encode apart from software Media Foundation
+// picked anyway, which was the whole ambiguity behind a slow-CPU stop timeout
+// (getopenscreen/openscreen#460) before this field existed.
+constexpr const char* kVideoEncoderRuntimeHardware = "hardware";
+constexpr const char* kVideoEncoderRuntimeSoftware = "software";
+// Introspection itself failed (no IMFSinkWriterEx, no encoder node found in
+// the resolved topology, GetAttributes refused). Reported as its own value
+// rather than guessed into hardware or software, because a bug report that
+// cannot tell "we checked and it's software" from "we couldn't check" would
+// draw the wrong conclusion either way.
+constexpr const char* kVideoEncoderRuntimeUnknown = "unknown";
 
 // Which MP4 flavour the recording was actually written in. The fragmented sink
 // writes a self-describing moof+mdat pair roughly every second, so a helper the
@@ -97,6 +130,9 @@ public:
     bool writeAudio(const BYTE* data, DWORD byteCount, int64_t timestampHns, int64_t durationHns);
     bool finalize();
     const char* videoEncoderSelection() const;
+    // Best-effort, read only after initialize() returns true. See the
+    // kVideoEncoderRuntime* constants above for what each value means.
+    const char* videoEncoderRuntime() const;
     // Which container initialize() settled on, which is not necessarily the one
     // it asked for: the fragmented sink degrades to the plain one rather than
     // failing a recording. A bug report that cannot tell the two apart cannot
@@ -150,7 +186,7 @@ private:
     // built before the sink writer exists (buildAacOutputType in the .cpp),
     // because MFCreateFMPEG4MediaSink takes both output types at construction:
     // a fragmented sink has all its streams before anything can be added to it.
-    bool configureAudioStream(const AudioInputFormat& audioFormat);
+    bool configureAudioStream(const AudioInputFormat& audioFormat, const MFEncoderOptions& options);
     void releaseSinkWriter();
 
     Microsoft::WRL::ComPtr<IMFSinkWriter> sinkWriter_;
@@ -202,5 +238,6 @@ private:
     bool finalized_ = false;
     bool useDxgiInput_ = false;
     const char* videoEncoderSelection_ = kVideoEncoderSelectionDefault;
+    const char* videoEncoderRuntime_ = kVideoEncoderRuntimeUnknown;
     const char* containerFormat_ = kContainerFormatMp4;
 };

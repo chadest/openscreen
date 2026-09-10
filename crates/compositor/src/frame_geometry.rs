@@ -284,6 +284,23 @@ pub(crate) fn cover_crop_uv(visible: [f32; 2], tex: [f32; 2], box_ar: f32) -> (f
     let [u0, v0, u1, v1] = cover_uv_rect(full, tex, box_ar);
     (u0, v0, u1, v1)
 }
+
+/// Camera equivalent of the screen crop pipeline: apply the user crop first, then a centred
+/// cover-crop inside that authored window so arbitrary layout slots never stretch the image.
+pub(crate) fn webcam_source_rect(
+    visible: [f32; 2],
+    tex: [f32; 2],
+    crop: Option<SceneCrop>,
+    box_ar: f32,
+) -> [f32; 4] {
+    let u_max = visible[0].max(1.0) / tex[0].max(1.0);
+    let v_max = visible[1].max(1.0) / tex[1].max(1.0);
+    cover_uv_rect(
+        screen_source_rect(u_max, v_max, crop, 1.0, [0.5, 0.5]),
+        tex,
+        box_ar,
+    )
+}
 /// Rétrécit un rect SOURCE déjà exprimé en UV (`[u0, v0, u1, v1]`) autour de son
 /// centre pour qu'il porte le ratio `box_ar` une fois rapporté aux pixels de la
 /// texture. C'est la forme générale de `object-fit: cover`, et LA primitive qui
@@ -362,7 +379,7 @@ pub(crate) fn cursor_sprite_dst(center: [f32; 2], w: f32, h: f32, hotspot: [f32;
 /// donc pas seulement sa position qu'il faut projeter mais son sprite entier : autrement il se
 /// lit comme un autocollant plat posé sur une scène en perspective.
 #[derive(Clone, Copy)]
-pub(crate) enum CursorPlacement {
+pub enum CursorPlacement {
     /// Écran droit : centre en coordonnées sortie 0..1.
     Upright { center: [f32; 2] },
     /// Écran incliné : position 0..1 DANS le plan, plus de quoi projeter les coins du sprite.
@@ -715,6 +732,7 @@ pub struct FrameGeometryInput<'a> {
 pub struct FrameGeometry {
     pub scene_preset: Option<String>,
     pub mb_taps: f32,
+    pub mb_amount: f32,
     pub source_t: f32,
     pub zoom_rotation: [f32; 3],
     pub padding_scale: f32,
@@ -741,6 +759,44 @@ pub struct FrameGeometry {
     pub w_px: [f32; 2],
     pub w_radius: f32,
     pub shape_fade: f32,
+}
+
+/// Rect de destination d'une annotation dans un rect d'ancrage, en fractions de la sortie.
+///
+/// `anchor` est TOUJOURS `s_ann`, le rect écran sans le zoom — jamais `s_dst`. Les deux
+/// coïncident sans zoom, ce qui rend l'erreur invisible sur la moitié des scènes ; sous
+/// zoom, `s_dst` grandit et emmène annotations et sous-titres avec lui, alors que le
+/// contrat de `SceneAnnotation` les veut « deliberately NOT affected by the zoom crop ».
+///
+/// Version libre plutôt que méthode : Windows déstructure `FrameGeometry` dès l'entrée de
+/// `compose_frame`, donc il n'a plus de `&self` à offrir quand il dessine les annotations.
+/// Les trois backends partagent malgré tout CETTE arithmétique-ci — le bug est reparu sur
+/// Linux après avoir été corrigé sur Windows et macOS (issue #179) parce que chacun en
+/// gardait sa copie.
+///
+/// Attention : le choix du rect passé en `anchor` reste, lui, au call site des backends
+/// Metal et D3D (leur `draw_annotations` prend le rect en paramètre). Seul Linux part
+/// directement de `FrameGeometry`. Passer `s_dst` ici reste donc possible sur deux
+/// backends sur trois — d'où le nom du paramètre côté appelants, et les tests.
+pub fn annotation_dst_in(anchor: [f32; 4], x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
+    [anchor[0] + x * anchor[2], anchor[1] + y * anchor[3], w * anchor[2], h * anchor[3]]
+}
+
+impl FrameGeometry {
+    /// `annotation_dst_in` appliqué à `s_ann`, pour les backends qui tiennent la géométrie
+    /// entière — c'est-à-dire ceux qui n'ont aucune raison de choisir un rect.
+    pub fn annotation_dst(&self, x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
+        annotation_dst_in(self.s_ann, x, y, w, h)
+    }
+
+    /// Hauteur en px du rect d'ancrage des annotations, pour `rh` px de sortie.
+    ///
+    /// `font_size_rel` est une fraction de cette hauteur (cf. `annotationScale.ts`) :
+    /// la prendre sur `s_dst` ferait grossir le texte avec le zoom, exactement comme
+    /// `annotation_dst` le déplacerait.
+    pub fn annotation_anchor_h_px(&self, rh: f32) -> f32 {
+        self.s_ann[3] * rh
+    }
 }
 
 /// Où va chaque calque, pour une frame — sans toucher au GPU.
@@ -807,6 +863,9 @@ pub fn plan_frame(input: &FrameGeometryInput) -> FrameGeometry {
         let mb_taps = scene
             .map(|s| 1.0 + s.effects.motion_blur.clamp(0.0, 1.0) * 15.0)
             .unwrap_or(cfg.mblur_n as f32);
+        let mb_amount = scene
+            .map(|s| s.effects.motion_blur.clamp(0.0, 1.0))
+            .unwrap_or(if cfg.mblur_n > 1 { 1.0 } else { 0.0 });
 
         // Zoom regions + Full Camera : filtrées en amont pour le clip actif et échantillonnées
         // dans le même référentiel source que le PTS du décodeur écran.
@@ -1110,6 +1169,7 @@ pub fn plan_frame(input: &FrameGeometryInput) -> FrameGeometry {
     FrameGeometry {
         scene_preset,
         mb_taps,
+        mb_amount,
         source_t,
         zoom_rotation,
         padding_scale,
@@ -1225,16 +1285,32 @@ pub fn plan_cursor(g: &FrameGeometry, input: &CursorPlanInput) -> Option<CursorP
 
     let blur01 = lp.cursor_motion_blur.clamp(0.0, 1.0);
     let has_scene = input.scene.is_some();
-    let trail_frames = if has_scene { 1.0 + blur01 * 7.0 } else { 1.0 };
-    let taps = if has_scene {
-        (1.0 + blur01 * 10.0).round() as u32
+    let (taps, prev_placement) = if !has_scene {
+        let taps = input.cfg.mblur_n;
+        let prev = if taps <= 1 {
+            placement
+        } else {
+            place(input.track.at(input.t - 1.0 / FPS), g.s_dst_prev).unwrap_or(placement)
+        };
+        (taps, prev)
+    } else if blur01 <= 0.001 {
+        (1, placement)
     } else {
-        input.cfg.mblur_n
-    };
-    let prev_placement = if taps <= 1 {
-        placement
-    } else {
-        place(input.track.at(input.t - trail_frames / FPS), g.s_dst_prev).unwrap_or(placement)
+        // Intervalle d'obturateur court, borné à 1 frame (100% blur = 1 frame d'exposition)
+        let trail_dt = blur01 / FPS;
+        let prev = place(input.track.at(input.t - trail_dt), g.s_dst_prev).unwrap_or(placement);
+        let c_now = placement.upright_center();
+        let c_prev = prev.upright_center();
+        let dist_px = ((c_now[0] - c_prev[0]) * rw).hypot((c_now[1] - c_prev[1]) * rh);
+        if dist_px < 1.0 {
+            // Quasi immobile : pas de copies superflues
+            (1, placement)
+        } else {
+            // Densité d'échantillonnage adaptée à la distance pour éliminer les fantômes discrets
+            let needed = (dist_px / 2.5).ceil() as u32;
+            let taps = needed.clamp(2, 16);
+            (taps, prev)
+        }
     };
 
     Some(CursorPlan {
@@ -1247,8 +1323,98 @@ pub fn plan_cursor(g: &FrameGeometry, input: &CursorPlanInput) -> Option<CursorP
     })
 }
 
+/// Poids d'un échantillon du flou de mouvement de curseur (0 = queue/passé, taps-1 = tête/courant).
+///
+/// Poids croissant de 0.25 (queue) à 1.0 (tête), normalisé pour que la somme valle 1.0.
+/// La somme des (0.25 + 0.75 * k / (taps - 1)) pour k de 0 à taps-1 vaut taps * (0.25 + 1.0) / 2 = taps * 0.625.
+#[inline]
+pub fn cursor_tap_weight(k: u32, taps: u32) -> f32 {
+    if taps <= 1 {
+        return 1.0;
+    }
+    let t = k as f32 / (taps - 1) as f32;
+    let ramp = 0.25 + 0.75 * t;
+    let sum = taps as f32 * 0.625;
+    ramp / sum
+}
+
+/// Les clés à évincer d'un cache de textures pour repasser sous `budget`, la moins récemment
+/// utilisée d'abord. `entries` porte `(clé, octets, tick d'usage)`.
+///
+/// `protect_from` est le tick au DÉBUT DE LA FRAME EN COURS : toute entrée touchée depuis est
+/// intouchable. Protéger la seule entrée qu'on vient de poser ne suffit pas — une frame échantillonne
+/// plusieurs textures (fond d'écran, fond de caméra, sprites de curseur), et évincer l'une d'elles
+/// parce qu'une autre vient d'arriver la ferait recharger à la frame suivante, puis rechasser la
+/// suivante : le cache se mettrait à battre au lieu de servir. Un décodage mesuré à 129 ms en
+/// release contre les ~3,5 ms d'une frame, c'est un échange qu'aucun budget mémoire ne justifie.
+///
+/// Si le jeu actif dépasse à lui seul le budget, la fonction s'arrête AU-DESSUS du budget plutôt
+/// que d'y toucher. Dépasser est le moindre mal.
+///
+/// Partagé plutôt que recopié dans chaque backend, pour la raison qui vaut pour tout ce module :
+/// trois copies d'une politique d'éviction finiraient par diverger sans que rien ne le dise.
+pub fn lru_evictions(entries: &[(String, u64, u64)], budget: u64, protect_from: u64) -> Vec<String> {
+    let mut total: u64 = entries.iter().map(|(_, bytes, _)| *bytes).sum();
+    if total <= budget {
+        return Vec::new();
+    }
+    let mut candidates: Vec<&(String, u64, u64)> =
+        entries.iter().filter(|(_, _, tick)| *tick < protect_from).collect();
+    candidates.sort_by_key(|(_, _, tick)| *tick);
+    let mut out = Vec::new();
+    for (key, bytes, _) in candidates {
+        if total <= budget {
+            break;
+        }
+        total -= bytes;
+        out.push(key.clone());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::lru_evictions;
+
+    /// `(clé, octets, tick)` — le tick croît avec l'usage, donc le plus petit est le plus ancien.
+    fn e(key: &str, mb: u64, tick: u64) -> (String, u64, u64) {
+        (key.to_string(), mb * 1024 * 1024, tick)
+    }
+
+    const BUDGET: u64 = 512 * 1024 * 1024;
+
+    #[test]
+    fn evicts_nothing_while_under_budget() {
+        assert!(lru_evictions(&[e("a", 100, 1), e("b", 100, 2)], BUDGET, 2).is_empty());
+    }
+
+    /// La plus ancienne part d'abord, et on s'arrête DÈS qu'on repasse sous le budget : évincer
+    /// au-delà ne rendrait que des rechargements.
+    #[test]
+    fn evicts_oldest_first_and_stops_at_the_budget() {
+        let entries = [e("vieux", 100, 1), e("moyen", 100, 2), e("neuf", 100, 9)];
+        assert_eq!(lru_evictions(&entries, 250 * 1024 * 1024, 9), vec!["vieux".to_string()]);
+    }
+
+    /// TOUT le jeu actif de la frame est protégé, pas seulement la dernière entrée posée. Une
+    /// frame qui échantillonne un fond d'écran ET un fond de caméra ne doit pas voir le premier
+    /// évincé parce que le second vient d'arriver — sinon les deux se chassent l'un l'autre à
+    /// chaque frame.
+    #[test]
+    fn protects_every_texture_used_this_frame() {
+        // frame commencée au tick 5 : `ecran` et `camera` servent tous deux maintenant.
+        let entries = [e("vieux", 100, 2), e("ecran", 400, 5), e("camera", 400, 6)];
+        assert_eq!(lru_evictions(&entries, BUDGET, 5), vec!["vieux".to_string()]);
+    }
+
+    /// Jeu actif plus gros que le budget : on rend ce qu'on peut et on reste au-dessus, plutôt que
+    /// de faire disparaître des textures dont cette frame a besoin.
+    #[test]
+    fn gives_up_rather_than_evicting_the_active_set() {
+        let entries = [e("a", 100, 1), e("actif", 900, 5)];
+        assert_eq!(lru_evictions(&entries, 256 * 1024 * 1024, 5), vec!["a".to_string()]);
+    }
+
     use super::*;
 
     /// La scène de référence du golden : un cas qui exerce le padding, le crop, le zoom,
@@ -1291,10 +1457,11 @@ mod tests {
         }
     }
 
-    /// La même scène, avec une région de zoom active à `t = 1.5 s`.
-    fn zoomed_golden_scene() -> Scene {
-        Scene::from_json(
-            r##"{
+    /// Le JSON de la scène zoomée, brut : `tilted_golden_scene` n'en change QUE la
+    /// rotation, et le faire par substitution garantit que les deux scènes ne diffèrent
+    /// pas ailleurs sans qu'on s'en aperçoive.
+    fn zoomed_golden_scene_json() -> &'static str {
+        r##"{
             "clips":[{"screenPath":"/s.mp4","webcamPath":"/w.mp4","sourceStartSec":0,"sourceEndSec":10,"webcamOffsetSec":0,"hasAudio":true}],
             "layout":{"preset":"picture-in-picture","webcamSize":0.44,"webcamShape":"circle","webcamMirror":false,
                       "webcamPosition":{"cx":0.8577,"cy":0.8159},"webcamReactiveZoom":false},
@@ -1304,9 +1471,12 @@ mod tests {
             "cursor":{"show":true,"size":7.76,"smoothing":0,"motionBlur":0.35,"clickBounce":1,"clipToBounds":false,"theme":"default"},
             "cropByClip":[{"x":0,"y":0,"width":0.61,"height":0.61}],
             "output":{"width":1170,"height":658,"fps":60}
-        }"##,
-        )
-        .expect("zoomed golden scene")
+        }"##
+    }
+
+    /// La même scène, avec une région de zoom active à `t = 1.5 s`.
+    fn zoomed_golden_scene() -> Scene {
+        Scene::from_json(zoomed_golden_scene_json()).expect("zoomed golden scene")
     }
 
     /// L'ancre des annotations ne bouge PAS avec le zoom, alors que la boîte écran, si.
@@ -1337,6 +1507,87 @@ mod tests {
         // Et sans zoom, l'ancre EST la boîte écran : `s_ann` ne doit pas devenir un rect
         // parallèle qui dériverait de `s_dst` pour d'autres raisons (padding, cover, crop).
         assert_eq!(a.s_ann, a.s_dst, "sans zoom, ancre et boîte écran coïncident");
+    }
+
+    /// La même scène, zoomée ET inclinée par un préset de rotation 3D.
+    fn tilted_golden_scene() -> Scene {
+        Scene::from_json(
+            &zoomed_golden_scene_json().replace(r#""rotation":"none""#, r#""rotation":"iso""#),
+        )
+        .expect("tilted golden scene")
+    }
+
+    /// Le rect et la taille de police d'une annotation ne bougent ni sous le zoom ni sous
+    /// une rotation 3D.
+    ///
+    /// `the_annotation_anchor_ignores_the_zoom` prouve que `plan_frame` **calcule** la
+    /// bonne ancre ; il ne dit rien de ce que le backend en fait. Linux, lui, refaisait
+    /// l'arithmétique contre `s_dst` — donc sous-titres qui grossissent et dérivent, sur
+    /// la seule plateforme qui n'avait pas été corrigée. Ce test porte sur les fonctions
+    /// que les backends appellent maintenant, pas sur le champ brut : la méthode côté
+    /// Linux ET `annotation_dst_in`, par où passent Metal et D3D.
+    ///
+    /// Ce qu'il ne couvre toujours PAS : le choix du rect au call site de Metal et D3D,
+    /// qui prennent leur ancre en paramètre. Ce niveau-là n'est vérifiable qu'en rendant
+    /// des pixels — c'est `compose_linux_annotation_ancree_hors_zoom`, opt-in.
+    ///
+    /// La rotation compte autant que le zoom : un préset iso/left/right est une propriété
+    /// de région de zoom, donc l'incliner amenait aussi la boîte — et les sous-titres
+    /// partaient avec elle, sans pour autant suivre le plan incliné. Les deux symptômes,
+    /// une seule cause.
+    #[test]
+    fn the_annotation_rect_and_font_ignore_zoom_and_rotation() {
+        let cfg = crate::config::all().pop().expect("au moins une config");
+        let rh = 658.0;
+        // Un rect d'annotation quelconque, décentré : au centre, un rect qui suivrait le
+        // zoom garderait le même centre et la moitié de l'erreur passerait inaperçue.
+        let (x, y, w, h) = (0.04, 0.78, 0.92, 0.22);
+
+        let plain = plan_frame(&golden_input(&golden_scene(), &cfg));
+        let zoomed = plan_frame(&golden_input(&zoomed_golden_scene(), &cfg));
+        let tilted = plan_frame(&golden_input(&tilted_golden_scene(), &cfg));
+
+        // Le garde-fou : sans lui, un `plan_frame` qui cesserait d'appliquer le zoom
+        // rendrait les assertions suivantes vraies pour la mauvaise raison.
+        assert_ne!(
+            plain.s_dst, zoomed.s_dst,
+            "le zoom doit agir sur la boîte écran — sinon ce test ne prouve rien"
+        );
+        assert!(
+            !crate::regions::is_identity_rotation(tilted.zoom_rotation),
+            "le préset iso doit produire une rotation — sinon ce test ne prouve rien"
+        );
+
+        let expected = plain.annotation_dst(x, y, w, h);
+        for (name, g) in [("zoom", &zoomed), ("rotation 3D", &tilted)] {
+            let got = g.annotation_dst(x, y, w, h);
+            assert_eq!(
+                got, expected,
+                "le rect de l'annotation a suivi le {name} : {got:?} au lieu de {expected:?}"
+            );
+            assert_eq!(
+                g.annotation_anchor_h_px(rh),
+                plain.annotation_anchor_h_px(rh),
+                "la taille de police a suivi le {name}"
+            );
+            // Metal et D3D n'appellent pas la méthode : ils passent leur rect d'ancrage à
+            // `annotation_dst_in`. Les deux chemins doivent rendre le MÊME rect, sinon le
+            // « corrigé sur une plateforme seulement » recommence par le bas.
+            assert_eq!(
+                annotation_dst_in(g.s_ann, x, y, w, h),
+                got,
+                "le chemin des backends Metal/D3D diverge de la méthode sous le {name}"
+            );
+            // Et le garde-fou qui donne un sens aux deux précédents : nourrie avec `s_dst`,
+            // la même fonction rend un rect DIFFÉRENT. Sans ça, un `annotation_dst_in`
+            // devenu constant satisferait tout ce qui précède.
+            assert_ne!(
+                annotation_dst_in(g.s_dst, x, y, w, h),
+                expected,
+                "sous le {name}, ancrer sur `s_dst` devrait déplacer le rect — \
+                 si les deux coïncident, ce test ne prouve plus rien"
+            );
+        }
     }
 
     /// **Le golden iso-render.**
@@ -1750,4 +2001,128 @@ mod tests {
         assert!((su0 - (960.0 - 720.0) * 0.5 / tex[0]).abs() < 1e-6);
         assert!((su1 - (960.0 + 720.0) * 0.5 / tex[0]).abs() < 1e-6);
     }
+
+    #[test]
+    fn webcam_crop_identity_keeps_the_full_visible_frame() {
+        let uv = webcam_source_rect([1280.0, 720.0], [2048.0, 1024.0], None, 16.0 / 9.0);
+        assert_rect(uv, [0.0, 0.0, 1280.0 / 2048.0, 720.0 / 1024.0]);
+    }
+
+    #[test]
+    fn webcam_crop_applies_authored_zoom_and_pan_before_layout_cover() {
+        let crop = SceneCrop {
+            x: 0.25,
+            y: 0.20,
+            width: 0.50,
+            height: 0.60,
+        };
+        let uv = webcam_source_rect([100.0, 100.0], [100.0, 100.0], Some(crop), 0.50 / 0.60);
+        assert_rect(uv, [0.25, 0.20, 0.75, 0.80]);
+    }
+
+    #[test]
+    fn cursor_tap_weight_sums_to_one_and_is_monotonically_increasing() {
+        assert_eq!(cursor_tap_weight(0, 1), 1.0);
+
+        for taps in [2, 4, 8, 11, 16] {
+            let mut sum = 0.0;
+            let mut prev_w = 0.0;
+            for k in 0..taps {
+                let w = cursor_tap_weight(k, taps);
+                assert!(w > 0.0, "poids positif");
+                if k > 0 {
+                    assert!(w > prev_w, "tête plus marquée que la queue : {w} > {prev_w}");
+                }
+                prev_w = w;
+                sum += w;
+            }
+            assert!((sum - 1.0).abs() < 1e-5, "somme des poids = 1.0 pour taps={taps}, got {sum}");
+        }
+    }
+
+    #[test]
+    fn plan_cursor_motion_blur_adaptive_and_stationary() {
+        let cfg = crate::config::all().pop().expect("cfg");
+        let track_immobile = crate::cursor::CursorTrack::new(
+            vec![(0.0, 0.5, 0.5), (2.0, 0.5, 0.5)],
+            vec![],
+            vec![],
+        );
+        let track_moving = crate::cursor::CursorTrack::new(
+            vec![(0.0, 0.1, 0.1), (1.0, 0.9, 0.9)],
+            vec![],
+            vec![],
+        );
+        let scene = zoomed_golden_scene();
+        let fg = FrameGeometry {
+            scene_preset: None,
+            mb_taps: 1.0,
+            mb_amount: 0.0,
+            source_t: 0.0,
+            zoom_rotation: [0.0, 0.0, 0.0],
+            padding_scale: 1.0,
+            cut: [0.0, 0.0, 1.0, 1.0],
+            s_dst: [0.0, 0.0, 1.0, 1.0],
+            s_dst_prev: [0.0, 0.0, 1.0, 1.0],
+            s_ann: [0.0, 0.0, 1.0, 1.0],
+            s_radius: 0.0,
+            frame_min_px: 1080.0,
+            w_dst: [0.0, 0.0, 0.0, 0.0],
+            w_dst_prev: [0.0, 0.0, 0.0, 0.0],
+            w_px: [0.0, 0.0],
+            w_radius: 0.0,
+            shape_fade: 0.0,
+        };
+
+        // 1. Curseur immobile avec blur actif -> taps = 1
+        let live_with_blur = LiveParams {
+            cursor_motion_blur: 0.8,
+            ..LiveParams::default()
+        };
+        let input_immobile = CursorPlanInput {
+            render_px: [1920.0, 1080.0],
+            u_max: 1.0,
+            v_max: 1.0,
+            cfg: &cfg,
+            live: live_with_blur,
+            scene: Some(&scene),
+            track: &track_immobile,
+            t: 0.5,
+        };
+        let plan = plan_cursor(&fg, &input_immobile).expect("plan cursor");
+        assert_eq!(plan.taps, 1, "curseur immobile doit rester à 1 tap");
+
+        // 2. Curseur avec blur = 0 -> taps = 1
+        let live_no_blur = LiveParams {
+            cursor_motion_blur: 0.0,
+            ..LiveParams::default()
+        };
+        let input_no_blur = CursorPlanInput {
+            render_px: [1920.0, 1080.0],
+            u_max: 1.0,
+            v_max: 1.0,
+            cfg: &cfg,
+            live: live_no_blur,
+            scene: Some(&scene),
+            track: &track_moving,
+            t: 0.5,
+        };
+        let plan = plan_cursor(&fg, &input_no_blur).expect("plan cursor");
+        assert_eq!(plan.taps, 1, "blur=0 doit donner taps = 1");
+
+        // 3. Curseur en mouvement rapide avec blur -> taps adaptatifs entre 2 et 16
+        let input_moving = CursorPlanInput {
+            render_px: [1920.0, 1080.0],
+            u_max: 1.0,
+            v_max: 1.0,
+            cfg: &cfg,
+            live: live_with_blur,
+            scene: Some(&scene),
+            track: &track_moving,
+            t: 0.5,
+        };
+        let plan = plan_cursor(&fg, &input_moving).expect("plan cursor");
+        assert!(plan.taps >= 2 && plan.taps <= 16, "taps adaptatifs dans [2, 16], got {}", plan.taps);
+    }
 }
+

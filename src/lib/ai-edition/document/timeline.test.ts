@@ -13,6 +13,7 @@ import {
 	normalizeIntervals,
 	planTimelineReplacement,
 	primaryAssetDuration,
+	projectRawTimelineSecToPlayback,
 	rederiveRegionMs,
 	removeClip,
 	removeRegion,
@@ -57,6 +58,7 @@ function makeDoc(overrides: Partial<AxcutDocument> = {}): AxcutDocument {
 		},
 		annotations: [],
 		zoomRanges: [],
+		audioTracks: [],
 		legacyEditor: null,
 		...overrides,
 	};
@@ -385,7 +387,11 @@ describe("timeline pure functions", () => {
 
 		/** Three clips, and a zoom straddling the boundary between the last two —
 		 *  stored as TWO fragments, which is the case where a reorder can pull the
-		 *  halves of one pill apart. */
+		 *  halves of one pill apart.
+		 *
+		 *  Their media timecodes deliberately do NOT meet: three clips of one recording that
+		 *  continue into each other are one clip (`withClipsChanged`), so a fixture built that
+		 *  way would collapse on the first structural edit and test nothing. */
 		function straddled(): AxcutDocument {
 			return makeDoc({
 				timeline: {
@@ -393,15 +399,15 @@ describe("timeline pure functions", () => {
 						makeClip({ id: "clip_1", sourceStartSec: 0, sourceEndSec: 20, timelineEndSec: 20 }),
 						makeClip({
 							id: "clip_2",
-							sourceStartSec: 20,
-							sourceEndSec: 40,
+							sourceStartSec: 25,
+							sourceEndSec: 45,
 							timelineStartSec: 20,
 							timelineEndSec: 40,
 						}),
 						makeClip({
 							id: "clip_3",
-							sourceStartSec: 40,
-							sourceEndSec: 60,
+							sourceStartSec: 50,
+							sourceEndSec: 70,
 							timelineStartSec: 40,
 							timelineEndSec: 60,
 						}),
@@ -420,8 +426,8 @@ describe("timeline pure functions", () => {
 						depth: 3,
 						focus: { cx: 0.5, cy: 0.5 },
 						clipId: "clip_2",
-						sourceStartSec: 35,
-						sourceEndSec: 40,
+						sourceStartSec: 40,
+						sourceEndSec: 45,
 					},
 					{
 						id: "zoom_b",
@@ -430,8 +436,8 @@ describe("timeline pure functions", () => {
 						depth: 3,
 						focus: { cx: 0.5, cy: 0.5 },
 						clipId: "clip_3",
-						sourceStartSec: 40,
-						sourceEndSec: 45,
+						sourceStartSec: 50,
+						sourceEndSec: 55,
 					},
 				] as unknown as AxcutDocument["zoomRanges"],
 			});
@@ -507,12 +513,12 @@ describe("timeline pure functions", () => {
 		});
 
 		it("holds after a setClipRange that narrows a fragment's window", () => {
-			const narrowed = setClipSourceRange(straddled(), "clip_2", 20, 37);
+			const narrowed = setClipSourceRange(straddled(), "clip_2", 25, 42);
 			assertAnchorsAgree(narrowed);
-			// zoom_a covered 35–40 of a window that now ends at 37: clamped, kept.
+			// zoom_a covered 40–45 of a window that now ends at 42: clamped, kept.
 			expect(narrowed.zoomRanges.find((z) => z.id === "zoom_a")).toMatchObject({
-				sourceStartSec: 35,
-				sourceEndSec: 37,
+				sourceStartSec: 40,
+				sourceEndSec: 42,
 			});
 		});
 	});
@@ -837,6 +843,90 @@ describe("resolvePlaybackSegments", () => {
 				"clip_2_seg2",
 			]);
 		});
+	});
+});
+
+describe("projectRawTimelineSecToPlayback (issue #350 audio-track/trim sync)", () => {
+	// One 10s clip, an interior trim removing raw 2..4 (2s). Output programme is 8s long.
+	const clip = makeClip({
+		sourceStartSec: 0,
+		sourceEndSec: 10,
+		timelineStartSec: 0,
+		timelineEndSec: 10,
+	});
+	const trim = makeTrim({ startSec: 2, endSec: 4 });
+
+	it("is the identity when there are no trims", () => {
+		expect(projectRawTimelineSecToPlayback([clip], [], 6)).toBeCloseTo(6, 6);
+	});
+
+	it("pulls a raw position after a cut earlier by the removed duration", () => {
+		// Raw 6 sits 2s past the 2s cut → output 4. This is the exact bug: the track was
+		// landing at 6 (delayed by the trim) instead of 4.
+		expect(projectRawTimelineSecToPlayback([clip], [trim], 6)).toBeCloseTo(4, 6);
+	});
+
+	it("is unaffected for a position before the cut", () => {
+		expect(projectRawTimelineSecToPlayback([clip], [trim], 1)).toBeCloseTo(1, 6);
+	});
+
+	it("collapses a position inside the trimmed gap to the end of the kept content before it", () => {
+		// Raw 3 is inside the removed 2..4 span → the next audible sample is at output 2.
+		expect(projectRawTimelineSecToPlayback([clip], [trim], 3)).toBeCloseTo(2, 6);
+	});
+
+	it("counts overlapping trims once (union, not sum)", () => {
+		// Trims [2,5] and [3,4] — the second nested in the first — remove 3s total, not 4.
+		// Raw 6 → output 3. The old per-trim accumulation double-counted and returned 2.
+		const trims = [
+			makeTrim({ id: "t1", startSec: 2, endSec: 5 }),
+			makeTrim({ id: "t2", startSec: 3, endSec: 4 }),
+		];
+		expect(projectRawTimelineSecToPlayback([clip], trims, 6)).toBeCloseTo(3, 6);
+	});
+
+	it("removes a raw gap between clips (concatenated, like the programme)", () => {
+		// Clip A ends at raw 10; clip B starts at raw 15 — a 5s gap with no content. The
+		// programme concatenates B straight after A, so raw 20 (5s into B) → output 15, NOT 20.
+		const clipA = makeClip({
+			id: "clip_a",
+			sourceStartSec: 0,
+			sourceEndSec: 10,
+			timelineStartSec: 0,
+			timelineEndSec: 10,
+		});
+		const clipB = makeClip({
+			id: "clip_b",
+			sourceStartSec: 0,
+			sourceEndSec: 10,
+			timelineStartSec: 15,
+			timelineEndSec: 25,
+		});
+		expect(projectRawTimelineSecToPlayback([clipA, clipB], [], 20)).toBeCloseTo(15, 6);
+	});
+
+	it("sums cuts across multiple clips", () => {
+		const clipA = makeClip({
+			id: "clip_a",
+			sourceStartSec: 0,
+			sourceEndSec: 10,
+			timelineStartSec: 0,
+			timelineEndSec: 10,
+		});
+		const clipB = makeClip({
+			id: "clip_b",
+			sourceStartSec: 10,
+			sourceEndSec: 20,
+			timelineStartSec: 10,
+			timelineEndSec: 20,
+		});
+		// Remove 1s from clip A (raw 5..6) and 2s from clip B (raw 12..14) → 3s total.
+		const trims = [
+			makeTrim({ id: "t1", startSec: 5, endSec: 6 }),
+			makeTrim({ id: "t2", startSec: 12, endSec: 14 }),
+		];
+		// Raw 18 is past both cuts (3s removed) → output 15.
+		expect(projectRawTimelineSecToPlayback([clipA, clipB], trims, 18)).toBeCloseTo(15, 6);
 	});
 });
 
@@ -1370,6 +1460,29 @@ describe("removeClip — delete a clip, close the gap, drop its pills", () => {
 		expect(next.zoomRanges[0]).toMatchObject({ startMs: 2000, endMs: 4000 });
 	});
 
+	it("preserves a bare clipId that is not a complete source anchor", () => {
+		const before = doc();
+		before.zoomRanges.push(
+			makeZoom({
+				id: "partial_anchor",
+				clipId: "clip_a",
+				sourceStartSec: undefined,
+				sourceEndSec: undefined,
+				startMs: 500,
+				endMs: 1500,
+			}),
+		);
+
+		const next = removeClip(before, "clip_a");
+
+		expect(next.zoomRanges.map((region) => region.id)).toEqual(["z_b", "partial_anchor"]);
+		expect(next.zoomRanges[1]).toMatchObject({
+			clipId: "clip_a",
+			startMs: 500,
+			endMs: 1500,
+		});
+	});
+
 	it("drops every modifier anchored to the last remaining clip", () => {
 		const before = makeDoc({
 			timeline: {
@@ -1385,6 +1498,37 @@ describe("removeClip — delete a clip, close the gap, drop its pills", () => {
 					clipId: undefined,
 					sourceStartSec: undefined,
 					sourceEndSec: undefined,
+				}),
+				// #249, and the branch nothing pinned: with no clip left, `removeClip` skips
+				// `rederiveRegionMs` entirely, so this filter is the only thing deciding. A bare
+				// `clipId` is not an anchor -- the region is still placed by its raw ms, so the
+				// clip going away must not take it. Without this case the ternary can be
+				// refactored back to the old semantics with a green suite.
+				makeZoom({
+					id: "partial_zoom",
+					clipId: "clip_a",
+					sourceStartSec: undefined,
+					sourceEndSec: undefined,
+				}),
+				// The same region after an in-memory edit that never round-tripped through zod:
+				// `null`, not `undefined`. The document layer used to call this one anchored
+				// (`!== undefined`) while the export path called it unanchored (`typeof`), and
+				// the two answers moved it to two different places -- `rederiveAnchoredRegion`
+				// slid it to `Math.max(null, ...)`, i.e. the clip start, while the exporter kept
+				// using its raw ms. One predicate now. Both halves get a case, because a single
+				// region carrying two `null`s still reads unanchored if only one check is
+				// loosened, and would pin neither.
+				makeZoom({
+					id: "null_start_zoom",
+					clipId: "clip_a",
+					sourceStartSec: null as unknown as undefined,
+					sourceEndSec: 1,
+				}),
+				makeZoom({
+					id: "null_end_zoom",
+					clipId: "clip_a",
+					sourceStartSec: 0,
+					sourceEndSec: null as unknown as undefined,
 				}),
 			],
 			annotations: [
@@ -1442,7 +1586,12 @@ describe("removeClip — delete a clip, close the gap, drop its pills", () => {
 		const next = removeClip(before, "clip_a");
 
 		expect(next.timeline.clips).toEqual([]);
-		expect(next.zoomRanges.map((region) => region.id)).toEqual(["legacy_zoom"]);
+		expect(next.zoomRanges.map((region) => region.id)).toEqual([
+			"legacy_zoom",
+			"partial_zoom",
+			"null_start_zoom",
+			"null_end_zoom",
+		]);
 		expect(next.annotations).toEqual([]);
 		expect((next.legacyEditor as { speedRegions: Array<{ id: string }> }).speedRegions).toEqual([
 			expect.objectContaining({ id: "legacy_speed" }),
@@ -1457,5 +1606,137 @@ describe("removeClip — delete a clip, close the gap, drop its pills", () => {
 		const next = removeClip(before, "clip_missing");
 		expect(next.timeline.clips.map((c) => c.id)).toEqual(["clip_a", "clip_b"]);
 		expect(next).toBe(before);
+	});
+});
+
+// #356: `legacyEditorSchema` is `z.object({}).passthrough()`, so a project file whose
+// envelope holds a non-array where a region collection belongs is schema-valid and loads
+// without a word. Every clip edit — delete / move / duplicate / source-range — walks those
+// collections through `mapAllRegionCollections`, which used to call `.filter()` on whatever
+// it found and take the whole editor down with `regions.filter is not a function`. The
+// malformed value is left exactly as it was found (the same call `upgradeV4DocumentToV5`
+// makes): the rest of the document still edits, and nothing the user had is discarded.
+describe("a malformed legacyEditor envelope", () => {
+	const doc = (legacyEditor: AxcutDocument["legacyEditor"]) =>
+		makeDoc({
+			timeline: {
+				...makeDoc().timeline,
+				clips: [
+					makeClip({ id: "clip_a", sourceStartSec: 0, sourceEndSec: 10, timelineEndSec: 10 }),
+					makeClip({
+						id: "clip_b",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 10,
+						timelineEndSec: 20,
+					}),
+				],
+			},
+			legacyEditor,
+		});
+
+	it("deletes a clip instead of throwing, and keeps the sibling collection working", () => {
+		const before = doc({
+			speedRegions: "oops",
+			cameraFullscreenRegions: [
+				{
+					id: "cam_b",
+					clipId: "clip_b",
+					sourceStartSec: 2,
+					sourceEndSec: 4,
+					startMs: 12000,
+					endMs: 14000,
+				},
+			],
+		});
+
+		const next = removeClip(before, "clip_a");
+
+		expect(next.timeline.clips.map((c) => c.id)).toEqual(["clip_b"]);
+		const legacy = next.legacyEditor as {
+			speedRegions: unknown;
+			cameraFullscreenRegions: Array<{ id: string; startMs: number; endMs: number }>;
+		};
+		// Untouched, not dropped — we cannot walk it, which is not a reason to delete it.
+		expect(legacy.speedRegions).toBe("oops");
+		// The well-formed neighbour is still rederived: clip_b slid 10s to the front.
+		expect(legacy.cameraFullscreenRegions).toEqual([
+			expect.objectContaining({ id: "cam_b", startMs: 2000, endMs: 4000 }),
+		]);
+	});
+
+	it("passes the envelope through by reference when no collection is walkable", () => {
+		const before = doc({ speedRegions: "oops", cameraFullscreenRegions: { id: "not_a_list" } });
+
+		const next = removeClip(before, "clip_a");
+
+		expect(next.timeline.clips.map((c) => c.id)).toEqual(["clip_b"]);
+		expect(next.legacyEditor).toBe(before.legacyEditor);
+		expect(next.legacyEditor).toEqual({
+			speedRegions: "oops",
+			cameraFullscreenRegions: { id: "not_a_list" },
+		});
+	});
+
+	it("edits a clip's source range instead of throwing", () => {
+		const before = doc({ speedRegions: null, cameraFullscreenRegions: 42 });
+
+		const next = setClipSourceRange(before, "clip_a", 2, 5);
+
+		expect(next.timeline.clips[0]).toMatchObject({ sourceStartSec: 2, sourceEndSec: 5 });
+		expect(next.legacyEditor).toEqual({ speedRegions: null, cameraFullscreenRegions: 42 });
+	});
+});
+
+describe("projectRawTimelineSecToPlayback with speed regions", () => {
+	const clip: AxcutClip = {
+		id: "c1",
+		assetId: "a1",
+		sourceStartSec: 0,
+		sourceEndSec: 20,
+		timelineStartSec: 0,
+		timelineEndSec: 20,
+		wordRefs: [],
+		origin: "user",
+		reason: "",
+	};
+
+	it("is the identity when nothing is sped up", () => {
+		expect(projectRawTimelineSecToPlayback([clip], [], 8, [])).toBeCloseTo(8, 6);
+	});
+
+	it("halves the time a 2x stretch takes to play", () => {
+		// Raw 4..8 at 2x plays in 2s, so raw 8 lands at output 6.
+		const speed = [{ startMs: 4000, endMs: 8000, speed: 2 }];
+		expect(projectRawTimelineSecToPlayback([clip], [], 4, speed)).toBeCloseTo(4, 6);
+		expect(projectRawTimelineSecToPlayback([clip], [], 6, speed)).toBeCloseTo(5, 6);
+		expect(projectRawTimelineSecToPlayback([clip], [], 8, speed)).toBeCloseTo(6, 6);
+		// Everything after carries the compression with it.
+		expect(projectRawTimelineSecToPlayback([clip], [], 12, speed)).toBeCloseTo(10, 6);
+	});
+
+	it("stretches a slow-motion region instead", () => {
+		const speed = [{ startMs: 0, endMs: 4000, speed: 0.5 }];
+		expect(projectRawTimelineSecToPlayback([clip], [], 4, speed)).toBeCloseTo(8, 6);
+	});
+
+	it("composes with trims", () => {
+		// Raw 2..4 cut, then raw 6..10 at 2x. Raw 12 = 2 kept + 2 kept + 2 (4s at 2x)
+		// + 2 = output 8.
+		const trim: AxcutTrimRange = {
+			id: "t1",
+			assetId: "a1",
+			startSec: 2,
+			endSec: 4,
+			origin: "user",
+			reason: "",
+		};
+		const speed = [{ startMs: 6000, endMs: 10_000, speed: 2 }];
+		expect(projectRawTimelineSecToPlayback([clip], [trim], 12, speed)).toBeCloseTo(8, 6);
+	});
+
+	it("ignores a nonsense rate rather than dividing by it", () => {
+		const speed = [{ startMs: 0, endMs: 4000, speed: 0 }];
+		expect(projectRawTimelineSecToPlayback([clip], [], 4, speed)).toBeCloseTo(4, 6);
 	});
 });

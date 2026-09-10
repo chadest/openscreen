@@ -8,19 +8,23 @@
 	"loadingVideo": "動画を読み込み中...",
 	"loadingEditor": "エディターを読み込み中...",
 	"errors": {
-		"noVideoLoaded": "動画が読み込まれていません",
-		"videoNotReady": "動画の準備ができていません",
-		"unableToDetermineSourcePath": "元動画のパスを特定できません",
-		"failedToSaveGif": "GIFの保存に失敗しました",
-		"gifExportFailed": "GIFのエクスポートに失敗しました",
-		"failedToSaveVideo": "動画の保存に失敗しました",
+		"exportBackgroundLoadFailed": "エクスポートに失敗しました: 背景画像を読み込めませんでした ({{url}})",
 		"exportFailed": "エクスポートに失敗しました",
 		"exportFailedWithError": "エクスポートに失敗しました: {{error}}",
+		"failedToRevealInFolder": "フォルダの表示に失敗しました: {{error}}",
 		"failedToSaveExport": "エクスポートの保存に失敗しました",
 		"failedToSaveExportedVideo": "エクスポートした動画の保存に失敗しました",
-		"failedToRevealInFolder": "フォルダの表示に失敗しました: {{error}}",
-		"exportBackgroundLoadFailed": "エクスポートに失敗しました: 背景画像を読み込めませんでした ({{url}})",
-		"previewCompositorUnavailable": "このマシンではプレビューを表示できません"
+		"failedToSaveGif": "GIFの保存に失敗しました",
+		"failedToSaveVideo": "動画の保存に失敗しました",
+		"gifExportFailed": "GIFのエクスポートに失敗しました",
+		"noVideoLoaded": "動画が読み込まれていません",
+		"previewCompositorUnavailable": "このマシンではプレビューを表示できません",
+		"trimNoFilm": "そこには切るものがありません。その言葉の下に映像がありません。",
+		"unableToDetermineSourcePath": "元動画のパスを特定できません",
+		"videoNotReady": "動画の準備ができていません",
+		"wordEditFailed": "この単語を変更できませんでした",
+		"wordInsertFailed": "この単語を追加できませんでした",
+		"wordRemoveFailed": "この単語を削除できませんでした"
 	},
 	"export": {
 		"canceled": "エクスポートがキャンセルされました",
@@ -43,6 +47,8 @@
 		"permissionDenied": "録画の権限が拒否されました。画面録画を許可してください。",
 		"cameraDisconnected": "ウェブカメラが切断されました。",
 		"cameraNotFound": "カメラが見つかりません。",
+		"cameraCaptureUnavailable": "カメラを開けませんでした。カメラなしで録画します。",
+		"microphoneDefaulted": "選択したマイクを特定できませんでした。既定の入力を録音します。",
 		"accessibilityAllowAndRetry": "OpenScreenにアクセシビリティアクセスを許可してから、もう一度録画を押してカウントダウンを開始してください。",
 		"selectSource": "録画するソースを選択してください"
 	},
@@ -69,6 +75,7 @@
 		"pasted": "{{region}}の属性を貼り付けました",
 		"nothingToCopy": "属性をコピーする領域を選択してください",
 		"nothingToPaste": "コピーされた属性がありません",
+		"pasteAssetMissing": "このオーディオトラックのファイルはこのプロジェクトにありません",
 		"kinds": {
 			"zoom": "ズーム",
 			"speed": "速度",
@@ -85,7 +92,6 @@
 		"switchToLightTheme": "ライトテーマに切り替え",
 		"switchToDarkTheme": "ダークテーマに切り替え",
 		"toggleTheme": "テーマを切り替え",
-		"settings": "設定",
 		"export": "エクスポート",
 		"renameProject": "プロジェクト名を変更",
 		"noProject": "プロジェクトなし",
@@ -104,6 +110,8 @@
 		"microphone": "マイク",
 		"camera": "カメラ",
 		"cursorHighlight": "カーソルの強調表示",
+		"autoZoom": "録画後に自動ズーム",
+		"autoZoomNeedsEditableCursor": "自動ズームには編集可能なカーソルが必要です。カーソルモードを切り替えてください。",
 		"on": "オン",
 		"off": "オフ",
 		"loading": "読み込み中…",
@@ -132,10 +140,11 @@
 		"emptyHint": "まだメディアがありません — 録画をインポートして開始してください。",
 		"importMedia": "メディアをインポート",
 		"added": "{{label}} を追加しました",
+		"addToTimeline": "タイムラインに追加",
+		"addedToTimeline": "{{label}} をタイムラインに追加しました",
 		"sourceTranscript": "ソースの文字起こし",
 		"close": "閉じる",
 		"transcriptReady": "文字起こし完了",
-		"notGeneratedYet": "まだ生成されていません",
 		"regenerateAs": "この言語で再生成",
 		"auto": "自動",
 		"regenerate": "再生成",
@@ -143,16 +152,12 @@
 		"notGeneratedHint": "まだ生成されていません — 言語を選んで再生成をクリックしてください。",
 		"transcribing": "文字起こし中",
 		"downloadingModel": "音声モデルをダウンロード中",
-		"transcribingEllipsis": "文字起こし中…",
+		"initializingModel": "音声モデルを起動しています",
 		"pendingTranscription": "文字起こし待機中",
 		"transcriptionFailed": "文字起こしに失敗しました",
+		"cpuBackendHint": "CPU で実行中 — GPU より約 2 倍低速です",
 		"noTranscript": "文字起こしなし",
-		"generating": "生成中",
-		"generationFailed": "生成に失敗しました",
-		"generated": "生成済み",
 		"generationFailedHint": "生成に失敗しました — 言語を選んで再生成してください。",
-		"noPreviewAvailable": "プレビューがありません",
-		"restart": "再生位置を先頭に戻す",
 		"detectedLanguage": "検出された言語: {{language}}",
 		"noAudioTrack": "音声トラックがありません",
 		"noAudioTrackHint": "このメディアには音声トラックがないため、文字起こしできません。",
@@ -209,18 +214,6 @@
 		"deleteRegion": "区間を削除",
 		"freehandRendersAsBox": "書き出しでは、フリーハンドの形は外接する矩形で覆われます。覆いすぎることはあっても、足りないことはありません。"
 	},
-	"leftPanel": {
-		"mediaTitle": "メディア",
-		"searchPlaceholder": "検索…",
-		"clearSearch": "検索をクリア",
-		"emptyHint": "このプロジェクトにはまだメディアがありません。下から動画をインポートしてください。",
-		"transcriptReadyBadge": "文字起こし準備完了"
-	},
-	"leftRail": {
-		"chat": "チャット",
-		"media": "メディア",
-		"ariaLabel": "左側のツール"
-	},
 	"chat": {
 		"changeProvider": "プロバイダーを変更",
 		"back": "戻る",
@@ -235,6 +228,8 @@
 		"selectModelFailed": "モデルを選択できませんでした",
 		"providerSettings": "プロバイダー設定…",
 		"applyEditsFailed": "エージェントの編集を適用できませんでした",
+		"agentEditConflict": "エージェントの処理中にプロジェクトが変更されたため、編集は適用されませんでした。",
+		"applyAnyway": "それでも適用",
 		"chatFailed": "チャットに失敗しました",
 		"rewindFailed": "巻き戻しに失敗しました",
 		"rewoundSuccess": "そのメッセージの先頭まで巻き戻しました",
@@ -281,7 +276,7 @@
 		"sendTitle": "送信（Enter）",
 		"send": "送信",
 		"rewindConfirmTitle": "ここまで巻き戻しますか？",
-		"rewindConfirmBody": "この時点以降のエージェントの編集とやり取りは元に戻されます。プロジェクト、会話、エージェントの状態が復元されます。",
+		"rewindConfirmBody": "この時点以降のエージェントの編集とやり取りは元に戻されます。プロジェクト、会話、エージェントの状態が復元されます。それ以降にあなたが行った編集も置き換えられます。",
 		"rewindConfirm": "巻き戻す",
 		"configureModel": "AIモデルを設定",
 		"historyDialog": {
@@ -311,7 +306,9 @@
 		"noMatches": "「{{query}}」に一致するプロジェクトがありません。",
 		"navigateHint": "で移動 ·",
 		"openHint": "で開く",
-		"browseFiles": "ファイルを参照…"
+		"browseFiles": "ファイルを参照…",
+		"deleteProject": "プロジェクトを削除",
+		"confirmDelete": "このプロジェクトを削除しますか？録画ファイルは保持されます。"
 	},
 	"editClipDialog": {
 		"title": "クリップを編集",
@@ -359,7 +356,13 @@
 	},
 	"preview": {
 		"videoPreview": "動画プレビュー",
-		"webcamPreview": "ウェブカメラのプレビュー（ドラッグで位置変更）"
+		"webcamPreview": "ウェブカメラのプレビュー（ドラッグで位置変更）",
+		"mediaError": {
+			"title": "プレビューを停止しました",
+			"description": "動画をデコードできませんでした。ファイルが破損しているか、まだ書き込み中か、プロジェクトが参照している場所にない可能性があります。プロジェクト自体は損なわれていません。",
+			"retry": "再試行",
+			"detail": "詳細: {{detail}}"
+		}
 	},
 	"annotationOverlay": {
 		"imageAlt": "注釈",

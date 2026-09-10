@@ -11,7 +11,11 @@ import { Loader2 } from "lucide-react";
 import { useScopedT } from "@/contexts/I18nContext";
 import {
 	type AssetTranscriptionView,
+	isCpuBackend,
+	isModelDownloadInFlight,
+	isSilentFailure,
 	progressFraction,
+	realtimeSpeed,
 } from "@/lib/ai-edition/transcription/status";
 
 /** Human-readable state of one asset's transcript, in the user's language. */
@@ -28,15 +32,31 @@ export function useTranscriptionLabel(): (view: AssetTranscriptionView) => strin
 				// screen to explain it, so it gets its own words rather than being
 				// labelled "Transcribing" — this is the phase most often mistaken for
 				// a hang, and the one `phase` was carried through the store for.
-				if (view.phase === "loading-model") return t("mediaStage.downloadingModel");
+				if (view.phase === "loading-model") {
+					return isModelDownloadInFlight(view)
+						? t("mediaStage.downloadingModel")
+						: t("mediaStage.initializingModel");
+				}
 				// Transcribing a long recording runs for minutes. A bare
 				// "Transcribing…" for that whole time is indistinguishable from a
 				// hang, so append the percentage as soon as the main process reports
 				// chunk progress — and only then (see `TranscriptionProgressBar`).
 				const fraction = progressFraction(view.progress);
-				return fraction === null
-					? t("mediaStage.transcribing")
-					: `${t("mediaStage.transcribing")} ${Math.round(fraction * 100)}%`;
+				const head =
+					fraction === null
+						? t("mediaStage.transcribing")
+						: `${t("mediaStage.transcribing")} ${Math.round(fraction * 100)}%`;
+				// Two things only the run itself knows: which device is doing the work,
+				// and how fast. "CPU" appears on the slow path ONLY — naming the GPU
+				// backend on every healthy run would be noise, whereas landing on CPU
+				// costs about half the throughput and happens through fallbacks that are
+				// otherwise completely silent. The speed shows on any backend: "is this
+				// moving, and how fast" is the same question at 5× as at 0.9×.
+				const suffix: string[] = [];
+				if (isCpuBackend(view.backend)) suffix.push("CPU");
+				const speed = realtimeSpeed(view.rtf);
+				if (speed !== null) suffix.push(`${speed.toFixed(1)}×`);
+				return suffix.length === 0 ? head : `${head} · ${suffix.join(" · ")}`;
 			}
 			case "empty":
 				return t("mediaStage.noSpeechDetected");
@@ -68,7 +88,12 @@ export function TranscriptionStatusDot({
 	view: AssetTranscriptionView;
 	size?: number;
 }) {
+	const t = useScopedT("editor");
 	const label = useTranscriptionLabel()(view);
+	// The label says "CPU"; this says what that costs. It has to be a <title>
+	// CHILD rather than the `title` attribute the dot below uses — lucide renders
+	// children inside its <svg>, and SVG has no tooltip-bearing `title` attribute.
+	const cpuHint = isCpuBackend(view.backend) ? t("mediaStage.cpuBackendHint") : null;
 	if (view.status === "running" || view.status === "queued") {
 		return (
 			<Loader2
@@ -76,10 +101,16 @@ export function TranscriptionStatusDot({
 				className="animate-spin"
 				style={{ color: "var(--accent)", flexShrink: 0 }}
 				aria-label={label}
-			/>
+			>
+				<title>{cpuHint ? `${label} — ${cpuHint}` : label}</title>
+			</Loader2>
 		);
 	}
-	const { fill, halo } = DOT_COLOR[view.status];
+	// A recording made with no system audio and no mic is not a broken job, so it
+	// gets the same amber as "no speech detected" rather than the danger red, and
+	// its label alone rather than a tooltip full of ffmpeg stderr (issue #628).
+	const silent = isSilentFailure(view);
+	const { fill, halo } = silent ? DOT_COLOR.empty : DOT_COLOR[view.status];
 	return (
 		<span
 			style={{
@@ -91,7 +122,7 @@ export function TranscriptionStatusDot({
 				flexShrink: 0,
 			}}
 			aria-label={label}
-			title={view.failure?.message ? `${label} — ${view.failure.message}` : label}
+			title={!silent && view.failure?.message ? `${label} — ${view.failure.message}` : label}
 		/>
 	);
 }

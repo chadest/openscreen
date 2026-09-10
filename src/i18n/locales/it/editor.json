@@ -8,19 +8,23 @@
 	"loadingVideo": "Caricamento video...",
 	"loadingEditor": "Caricamento editor...",
 	"errors": {
-		"noVideoLoaded": "Nessun video caricato",
-		"videoNotReady": "Video non pronto",
-		"unableToDetermineSourcePath": "Impossibile determinare il percorso del video sorgente",
-		"failedToSaveGif": "Impossibile salvare la GIF",
-		"gifExportFailed": "Esportazione GIF fallita",
-		"failedToSaveVideo": "Impossibile salvare il video",
+		"exportBackgroundLoadFailed": "Esportazione fallita: impossibile caricare l'immagine di sfondo ({{url}})",
 		"exportFailed": "Esportazione fallita",
 		"exportFailedWithError": "Esportazione fallita: {{error}}",
-		"exportBackgroundLoadFailed": "Esportazione fallita: impossibile caricare l'immagine di sfondo ({{url}})",
+		"failedToRevealInFolder": "Errore durante la visualizzazione nella cartella: {{error}}",
 		"failedToSaveExport": "Impossibile salvare l'esportazione",
 		"failedToSaveExportedVideo": "Impossibile salvare il video esportato",
-		"failedToRevealInFolder": "Errore durante la visualizzazione nella cartella: {{error}}",
-		"previewCompositorUnavailable": "Anteprima non disponibile su questo computer"
+		"failedToSaveGif": "Impossibile salvare la GIF",
+		"failedToSaveVideo": "Impossibile salvare il video",
+		"gifExportFailed": "Esportazione GIF fallita",
+		"noVideoLoaded": "Nessun video caricato",
+		"previewCompositorUnavailable": "Anteprima non disponibile su questo computer",
+		"trimNoFilm": "Non c'è niente da tagliare lì: sotto quelle parole non c'è filmato.",
+		"unableToDetermineSourcePath": "Impossibile determinare il percorso del video sorgente",
+		"videoNotReady": "Video non pronto",
+		"wordEditFailed": "Impossibile modificare questa parola",
+		"wordInsertFailed": "Impossibile aggiungere questa parola",
+		"wordRemoveFailed": "Impossibile eliminare questa parola"
 	},
 	"export": {
 		"canceled": "Esportazione annullata",
@@ -42,6 +46,8 @@
 		"cameraDenied": "Accesso alla fotocamera negato. La registrazione continuerà senza webcam.",
 		"cameraDisconnected": "Webcam disconnessa.",
 		"cameraNotFound": "Fotocamera non trovata.",
+		"cameraCaptureUnavailable": "Impossibile aprire la fotocamera. Registrazione senza di essa.",
+		"microphoneDefaulted": "Impossibile identificare il microfono scelto. Registrazione dall'ingresso predefinito.",
 		"permissionDenied": "Autorizzazione di registrazione negata. Consenti la registrazione dello schermo.",
 		"accessibilityAllowAndRetry": "Consenti l'accesso all'accessibilità per OpenScreen, poi premi di nuovo registra per avviare il conto alla rovescia.",
 		"selectSource": "Seleziona una sorgente da registrare"
@@ -69,6 +75,7 @@
 		"pasted": "Attributi di {{region}} incollati",
 		"nothingToCopy": "Seleziona una regione per copiarne gli attributi",
 		"nothingToPaste": "Nessun attributo copiato",
+		"pasteAssetMissing": "Il file di questa traccia audio non è in questo progetto",
 		"kinds": {
 			"zoom": "Zoom",
 			"speed": "Velocità",
@@ -85,7 +92,6 @@
 		"switchToLightTheme": "Passa al tema chiaro",
 		"switchToDarkTheme": "Passa al tema scuro",
 		"toggleTheme": "Cambia tema",
-		"settings": "Impostazioni",
 		"export": "Esporta",
 		"renameProject": "Rinomina progetto",
 		"noProject": "Nessun progetto",
@@ -104,6 +110,8 @@
 		"microphone": "Microfono",
 		"camera": "Fotocamera",
 		"cursorHighlight": "Evidenzia cursore",
+		"autoZoom": "Zoom automatico dopo la registrazione",
+		"autoZoomNeedsEditableCursor": "Lo zoom automatico richiede il cursore modificabile. Cambia la modalità del cursore per attivarlo.",
 		"on": "Attivo",
 		"off": "Disattivo",
 		"loading": "Caricamento…",
@@ -132,10 +140,11 @@
 		"emptyHint": "Nessun media ancora — importa una registrazione per iniziare.",
 		"importMedia": "Importa media",
 		"added": "{{label}} aggiunto",
+		"addToTimeline": "Aggiungi alla timeline",
+		"addedToTimeline": "{{label}} aggiunto alla timeline",
 		"sourceTranscript": "Trascrizione sorgente",
 		"close": "Chiudi",
 		"transcriptReady": "Trascrizione pronta",
-		"notGeneratedYet": "Non ancora generata",
 		"regenerateAs": "Rigenera in",
 		"auto": "Auto",
 		"regenerate": "Rigenera",
@@ -143,16 +152,12 @@
 		"notGeneratedHint": "Non ancora generata — scegli una lingua e clicca su rigenera.",
 		"transcribing": "Trascrizione in corso",
 		"downloadingModel": "Download del modello vocale",
-		"transcribingEllipsis": "Trascrizione in corso…",
+		"initializingModel": "Avvio del modello vocale",
 		"pendingTranscription": "Trascrizione in attesa",
 		"transcriptionFailed": "Trascrizione non riuscita",
+		"cpuBackendHint": "In esecuzione su CPU — circa 2× più lento che su GPU",
 		"noTranscript": "Nessuna trascrizione",
-		"generating": "Generazione in corso",
-		"generationFailed": "Generazione non riuscita",
-		"generated": "Generato",
 		"generationFailedHint": "Generazione non riuscita — scegli una lingua e rigenera.",
-		"noPreviewAvailable": "Anteprima non disponibile",
-		"restart": "Riavvia",
 		"detectedLanguage": "Lingua rilevata: {{language}}",
 		"noAudioTrack": "Nessuna traccia audio",
 		"noAudioTrackHint": "Questo contenuto non ha una traccia audio: non c'è nulla da trascrivere.",
@@ -209,18 +214,6 @@
 		"deleteRegion": "Elimina regione",
 		"freehandRendersAsBox": "Nell'esportazione, una forma libera è coperta dal suo rettangolo di delimitazione: copre di più, mai di meno."
 	},
-	"leftPanel": {
-		"mediaTitle": "Contenuti multimediali",
-		"searchPlaceholder": "Cerca…",
-		"clearSearch": "Cancella ricerca",
-		"emptyHint": "Nessun contenuto multimediale in questo progetto. Importa un video qui sotto.",
-		"transcriptReadyBadge": "TRASCRIZIONE PRONTA"
-	},
-	"leftRail": {
-		"chat": "Chat",
-		"media": "Contenuti multimediali",
-		"ariaLabel": "Strumenti a sinistra"
-	},
 	"chat": {
 		"changeProvider": "Cambia provider",
 		"back": "Indietro",
@@ -235,6 +228,8 @@
 		"selectModelFailed": "Impossibile selezionare il modello",
 		"providerSettings": "Impostazioni provider…",
 		"applyEditsFailed": "Impossibile applicare le modifiche dell'agente",
+		"agentEditConflict": "Le modifiche dell'agente non sono state applicate perché il progetto è cambiato durante l'elaborazione.",
+		"applyAnyway": "Applica comunque",
 		"chatFailed": "Chat non riuscita",
 		"rewindFailed": "Riavvolgimento non riuscito",
 		"rewoundSuccess": "Riavvolto all'inizio di quel messaggio",
@@ -281,7 +276,7 @@
 		"sendTitle": "Invia (Invio)",
 		"send": "Invia",
 		"rewindConfirmTitle": "Riavvolgere qui?",
-		"rewindConfirmBody": "Le modifiche dell'agente e i turni successivi a questo punto verranno annullati. Il progetto, la conversazione e lo stato dell'agente verranno ripristinati.",
+		"rewindConfirmBody": "Le modifiche dell'agente e i turni successivi a questo punto verranno annullati. Il progetto, la conversazione e lo stato dell'agente verranno ripristinati. Anche le modifiche che hai fatto da allora verranno sostituite.",
 		"rewindConfirm": "Riavvolgi",
 		"configureModel": "Configura modello IA",
 		"historyDialog": {
@@ -311,7 +306,9 @@
 		"noMatches": "Nessun progetto corrisponde a \"{{query}}\".",
 		"navigateHint": "per navigare ·",
 		"openHint": "per aprire",
-		"browseFiles": "Sfoglia file…"
+		"browseFiles": "Sfoglia file…",
+		"deleteProject": "Elimina progetto",
+		"confirmDelete": "Eliminare questo progetto? Le tue registrazioni vengono conservate."
 	},
 	"editClipDialog": {
 		"title": "Modifica clip",
@@ -359,7 +356,13 @@
 	},
 	"preview": {
 		"videoPreview": "Anteprima video",
-		"webcamPreview": "Anteprima webcam (trascina per riposizionare)"
+		"webcamPreview": "Anteprima webcam (trascina per riposizionare)",
+		"mediaError": {
+			"title": "Anteprima interrotta",
+			"description": "Non è stato possibile decodificare il video. Il file potrebbe essere danneggiato, ancora in scrittura o non più dove il progetto lo cerca: il progetto è intatto.",
+			"retry": "Riprova",
+			"detail": "Dettagli: {{detail}}"
+		}
 	},
 	"annotationOverlay": {
 		"imageAlt": "Annotazione",

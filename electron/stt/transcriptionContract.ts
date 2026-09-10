@@ -38,6 +38,28 @@ export type SttBackend =
 	| "whispercpp-cuda"
 	| "whispercpp-cpu";
 
+/**
+ * Wall-clock cost of a transcription, measured by the helper around
+ * `whisper_full` (`electron/native/whisper-stt/src/main.cpp`) and reported on
+ * every `/inference` response. Used both per chunk and summed over a whole run.
+ *
+ * `rtf` follows whisper.cpp's convention, which is also the POC report's:
+ * wall-clock DIVIDED BY audio duration, so lower is faster and < 1 means faster
+ * than real-time. The figure a reader can act on ("2.1x real-time") is its
+ * reciprocal — see `realtimeSpeed()` in
+ * `src/lib/ai-edition/transcription/status.ts`.
+ *
+ * Optional everywhere it appears because a staged helper binary can pre-date
+ * the `timing` field: `electron/native/bin/<tag>/` is gitignored, so a dev tree
+ * keeps whatever was last built there. Absent rather than zeroed on purpose —
+ * "not reported" and "took no time" must not render the same way.
+ */
+export interface SttTiming {
+	elapsedSec: number;
+	audioSec: number;
+	rtf: number;
+}
+
 /** Status phase the renderer surfaces over `onStatus("model" | "transcribe")`. */
 export type SttStatusPhase = "model" | "transcribe";
 
@@ -58,11 +80,50 @@ export interface SttStatusEvent {
 	 */
 	completedSec?: number;
 	totalSec?: number;
+	/**
+	 * Backend the helper ACTUALLY bound, as reported by the chunk that just
+	 * landed — not `gpuDetector`'s guess, which only picks a binary.
+	 *
+	 * This is the only signal a user has that they are on the slow path. Both
+	 * routes onto it are silent (the helper retries without GPU when init
+	 * returns null; the Node side can relaunch with `--cpu`), and the CPU path
+	 * costs roughly half the throughput — median 2.07x on the reference machine,
+	 * see tools/stt-eval/whispercpp-dtw-poc/REPORT.md 5.3.
+	 */
+	backend?: SttBackend;
+	/**
+	 * Real-time factor for the run SO FAR (total wall-clock / total audio), not
+	 * for the chunk that just landed. Per-chunk values swing with how much speech
+	 * a chunk happens to hold, and a figure that jumps every 90s reads as noise
+	 * rather than as progress.
+	 *
+	 * Computed over the chunks that reported timing. Unlike
+	 * `SttTranscribeResponse.timing` this is a ratio rather than a total, so it
+	 * stays meaningful even when a chunk reports nothing.
+	 */
+	rtf?: number;
 }
 
 /** IPC request: renderer → main. */
 export interface SttTranscribeRequest {
-	samples: Float32Array;
+	/**
+	 * Mono-16k samples the CALLER decoded. Optional since native extraction landed:
+	 * pass `sourcePath` instead and the main process decodes with ffmpeg, off the UI
+	 * thread and without the renderer ever holding the audio. Kept for the caption
+	 * path, which already has samples in hand and has no file to point at.
+	 *
+	 * Exactly one of `samples` / `sourcePath` is required.
+	 */
+	samples?: Float32Array;
+	/**
+	 * A media file for the main process to decode itself (ffmpeg -> mono 16k f32).
+	 * Preferred: the renderer's own pipeline read the whole file, copied it twice and
+	 * resampled it on the UI thread, which is what froze the editor at open.
+	 *
+	 * The caller falls back to its own decode when this cannot be honoured — see
+	 * `FfmpegUnavailableError`.
+	 */
+	sourcePath?: string;
 	/**
 	 * ISO 639-1 language code (e.g. "en", "fr"). Omit / `"auto"` to let Whisper detect.
 	 * The spec locks language detection on by default; we only honour an explicit value.
@@ -70,12 +131,29 @@ export interface SttTranscribeRequest {
 	language?: string;
 }
 
+/**
+ * Marker carried in the error message when the main process cannot decode a
+ * `sourcePath` because no ffmpeg is resolvable on this install.
+ *
+ * A string rather than an error class because this crosses `ipcRenderer.invoke`,
+ * which reconstructs a plain `Error` from the message and drops the prototype and
+ * the `name`. Exported so neither side spells it out by hand — a fallback keyed on
+ * a literal typed twice is a fallback that silently stops working.
+ */
+export const STT_NATIVE_EXTRACTION_UNAVAILABLE = "stt:native-extraction-unavailable";
+
 /** IPC response: main → renderer. */
 export interface SttTranscribeResponse {
 	segments: SttPhraseSegment[];
 	wordSegments: SttWordSegment[];
 	detectedLanguage: string;
 	backend: SttBackend;
+	/**
+	 * Summed over every chunk of this request — and absent unless ALL of them
+	 * reported, because a total that quietly skips a chunk describes a shorter
+	 * recording than the one that was transcribed.
+	 */
+	timing?: SttTiming;
 }
 
 /** IPC success envelope; thrown errors cross as a rejection. */

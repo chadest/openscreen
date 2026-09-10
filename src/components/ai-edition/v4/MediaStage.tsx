@@ -1,17 +1,22 @@
 import { ArrowDown, Film, Plus, RotateCw, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { useScopedT } from "@/contexts/I18nContext";
-import type { AxcutAsset } from "@/lib/ai-edition/schema";
+import { useI18n, useScopedT } from "@/contexts/I18nContext";
+import type { AxcutAsset, TranscriptLanguageCode } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
 	useTranscriptionStore,
 } from "@/lib/ai-edition/store/transcriptionStore";
 import { formatSeconds } from "@/lib/ai-edition/timeline/format";
-import type {
-	AssetTranscriptionStatus,
-	AssetTranscriptionView,
+import {
+	languageLabel,
+	sortedLanguageOptions,
+} from "@/lib/ai-edition/transcription/languageLabels";
+import {
+	type AssetTranscriptionStatus,
+	type AssetTranscriptionView,
+	isSilentFailure,
 } from "@/lib/ai-edition/transcription/status";
 import { formatBytes } from "@/utils/formatBytes";
 import {
@@ -33,8 +38,23 @@ function basename(path: string): string {
 	return path.split(/[\\/]/).pop() ?? path;
 }
 
-export function MediaStage() {
+export async function addSelectedAssetToTimeline(
+	selected: Pick<AxcutAsset, "id" | "label" | "originalPath"> | null,
+	onAddToTimeline: (assetId: string) => Promise<void>,
+	onSuccess: (label: string) => void,
+): Promise<void> {
+	if (!selected) return;
+	await onAddToTimeline(selected.id);
+	onSuccess(selected.label || basename(selected.originalPath));
+}
+
+export function MediaStage({
+	onAddToTimeline,
+}: {
+	onAddToTimeline: (assetId: string) => Promise<void>;
+}) {
 	const t = useScopedT("editor");
+	const { locale } = useI18n();
 	const projectId = useProjectStore((s) => s.projectId);
 	const document = useProjectStore((s) => s.document);
 	const addAsset = useProjectStore((s) => s.addAsset);
@@ -48,9 +68,16 @@ export function MediaStage() {
 	const [busy, setBusy] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [detailOpen, setDetailOpen] = useState(false);
-	const [lang, setLang] = useState("auto");
+	const [lang, setLang] = useState<TranscriptLanguageCode>("auto");
+	const regenLanguageOptions = useMemo(
+		() => sortedLanguageOptions(locale, t("mediaStage.auto")),
+		[locale, t],
+	);
 
-	const assets = document?.assets ?? [];
+	// Video only — this stage arranges clips. Imported audio (issue #350) is a
+	// timeline overlay added from the timeline toolbar, not a clip, so it never
+	// appears in this list.
+	const assets = (document?.assets ?? []).filter((a) => a.kind !== "audio");
 	const filtered = useMemo(
 		() =>
 			assets.filter((a) => {
@@ -93,6 +120,12 @@ export function MediaStage() {
 	const openDetail = (asset: AxcutAsset) => {
 		setSelectedId(asset.id);
 		setDetailOpen(true);
+	};
+
+	const addSelectedToTimeline = () => {
+		void addSelectedAssetToTimeline(selected, onAddToTimeline, (label) => {
+			toast.success(t("mediaStage.addedToTimeline", { label }));
+		}).catch(() => undefined);
 	};
 
 	return (
@@ -234,7 +267,7 @@ export function MediaStage() {
 								style={{
 									fontSize: 12,
 									color: "var(--muted)",
-									marginBottom: 16,
+									marginBottom: 10,
 									whiteSpace: "nowrap",
 									overflow: "hidden",
 									textOverflow: "ellipsis",
@@ -242,6 +275,29 @@ export function MediaStage() {
 							>
 								{selected.label || basename(selected.originalPath)}
 							</div>
+							<button
+								type="button"
+								onClick={addSelectedToTimeline}
+								style={{
+									width: "100%",
+									height: 36,
+									display: "inline-flex",
+									alignItems: "center",
+									justifyContent: "center",
+									gap: 7,
+									marginBottom: 16,
+									borderRadius: 9,
+									border: "1px solid var(--accent)",
+									background: "var(--accent)",
+									color: "var(--accent-on)",
+									fontSize: 12.5,
+									fontWeight: 650,
+									cursor: "pointer",
+								}}
+							>
+								<Plus size={14} />
+								{t("mediaStage.addToTimeline")}
+							</button>
 
 							<div style={{ marginBottom: 16 }}>
 								<span
@@ -251,14 +307,19 @@ export function MediaStage() {
 										gap: 6,
 										padding: "5px 10px 5px 8px",
 										borderRadius: 9999,
+										// A silent recording reads as a verdict about the media, not as a
+										// broken run, so it keeps the neutral accent rather than the danger
+										// red the engine failures get (issue #628).
 										background:
-											selectedTranscription.status === "failed"
+											selectedTranscription.status === "failed" &&
+											!isSilentFailure(selectedTranscription)
 												? "var(--danger-soft)"
 												: selectedTranscription.status === "ready"
 													? "var(--success-soft)"
 													: "var(--accent-soft)",
 										color:
-											selectedTranscription.status === "failed"
+											selectedTranscription.status === "failed" &&
+											!isSilentFailure(selectedTranscription)
 												? "var(--danger)"
 												: selectedTranscription.status === "ready"
 													? "var(--success)"
@@ -271,11 +332,9 @@ export function MediaStage() {
 									{transcriptionLabel(selectedTranscription)}
 								</span>
 								{/* The language whisper resolved on the first chunk, which every later
-								    chunk was then pinned to. It had a pill in SourceTranscriptModal,
-								    but that lives under LeftPanel's `MediaPane` — and the only mount
-								    site is `<LeftPanel active="chat" />`, a literal, so it renders
-								    `ChatStripPanel` and nothing else. The value was reaching the
-								    document and being displayed nowhere. It belongs next to
+								    chunk was then pinned to. Its only pill used to live in the v3 left
+								    panel's transcript modal, which nothing mounted, so the value was
+								    reaching the document and being displayed nowhere. It belongs next to
 								    "Regenerate as" below in any case: that selector is the control
 								    you set BECAUSE of what was detected. */}
 								{transcript?.language && transcript.language !== "auto" ? (
@@ -292,7 +351,9 @@ export function MediaStage() {
 											fontWeight: 600,
 										}}
 									>
-										{t("mediaStage.detectedLanguage", { language: transcript.language })}
+										{t("mediaStage.detectedLanguage", {
+											language: languageLabel(transcript.language, locale),
+										})}
 									</span>
 								) : null}
 							</div>
@@ -329,7 +390,7 @@ export function MediaStage() {
 								<div style={{ display: "flex", gap: 8 }}>
 									<select
 										value={lang}
-										onChange={(e) => setLang(e.target.value)}
+										onChange={(e) => setLang(e.target.value as TranscriptLanguageCode)}
 										style={{
 											flex: 1,
 											minWidth: 0,
@@ -344,10 +405,11 @@ export function MediaStage() {
 											outline: "none",
 										}}
 									>
-										<option value="auto">{t("mediaStage.auto")}</option>
-										<option value="en">English</option>
-										<option value="fr">Français</option>
-										<option value="es">Español</option>
+										{regenLanguageOptions.map(({ code, label }) => (
+											<option key={code} value={code}>
+												{label}
+											</option>
+										))}
 									</select>
 									<button
 										type="button"
@@ -394,10 +456,12 @@ export function MediaStage() {
 								) : (
 									<span style={{ color: "var(--muted)" }}>
 										{selectedBusy
-											? t("mediaStage.transcribingEllipsis")
-											: selectedTranscription.status === "failed"
-												? t("mediaStage.generationFailedHint")
-												: t("mediaStage.notGeneratedHint")}
+											? transcriptionLabel(selectedTranscription)
+											: isSilentFailure(selectedTranscription)
+												? t("mediaStage.noAudioTrackHint")
+												: selectedTranscription.status === "failed"
+													? t("mediaStage.generationFailedHint")
+													: t("mediaStage.notGeneratedHint")}
 									</span>
 								)}
 							</div>

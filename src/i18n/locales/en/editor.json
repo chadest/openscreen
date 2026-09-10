@@ -8,19 +8,23 @@
 	"loadingVideo": "Loading video...",
 	"loadingEditor": "Loading editor...",
 	"errors": {
-		"noVideoLoaded": "No video loaded",
-		"videoNotReady": "Video not ready",
-		"unableToDetermineSourcePath": "Unable to determine source video path",
-		"failedToSaveGif": "Failed to save GIF",
-		"gifExportFailed": "GIF export failed",
-		"failedToSaveVideo": "Failed to save video",
+		"exportBackgroundLoadFailed": "Export failed: could not load background image ({{url}})",
 		"exportFailed": "Export failed",
 		"exportFailedWithError": "Export failed: {{error}}",
-		"exportBackgroundLoadFailed": "Export failed: could not load background image ({{url}})",
+		"failedToRevealInFolder": "Error revealing in folder: {{error}}",
 		"failedToSaveExport": "Failed to save export",
 		"failedToSaveExportedVideo": "Failed to save exported video",
-		"failedToRevealInFolder": "Error revealing in folder: {{error}}",
-		"previewCompositorUnavailable": "Preview unavailable on this machine"
+		"failedToSaveGif": "Failed to save GIF",
+		"failedToSaveVideo": "Failed to save video",
+		"gifExportFailed": "GIF export failed",
+		"noVideoLoaded": "No video loaded",
+		"previewCompositorUnavailable": "Preview unavailable on this machine",
+		"trimNoFilm": "Nothing to cut there — no film sits under those words.",
+		"unableToDetermineSourcePath": "Unable to determine source video path",
+		"videoNotReady": "Video not ready",
+		"wordEditFailed": "Could not change that word",
+		"wordInsertFailed": "Could not add that word",
+		"wordRemoveFailed": "Could not delete that word"
 	},
 	"export": {
 		"canceled": "Export canceled",
@@ -42,6 +46,8 @@
 		"cameraDenied": "Camera access denied. Recording will continue without webcam.",
 		"cameraDisconnected": "Webcam disconnected.",
 		"cameraNotFound": "Camera not found.",
+		"cameraCaptureUnavailable": "The camera could not be opened. Recording without it.",
+		"microphoneDefaulted": "The chosen microphone could not be identified. Recording the default input.",
 		"permissionDenied": "Recording permission denied. Please allow screen recording.",
 		"accessibilityAllowAndRetry": "Allow Accessibility access for OpenScreen, then press record again to start the countdown.",
 		"selectSource": "Please select a source to record"
@@ -69,6 +75,7 @@
 		"pasted": "{{region}} attributes pasted",
 		"nothingToCopy": "Select a region to copy its attributes",
 		"nothingToPaste": "No attributes copied yet",
+		"pasteAssetMissing": "That audio track's file isn't in this project",
 		"kinds": {
 			"zoom": "Zoom",
 			"speed": "Speed",
@@ -85,7 +92,6 @@
 		"switchToLightTheme": "Switch to light theme",
 		"switchToDarkTheme": "Switch to dark theme",
 		"toggleTheme": "Toggle theme",
-		"settings": "Settings",
 		"export": "Export",
 		"renameProject": "Rename project",
 		"noProject": "No project",
@@ -104,6 +110,8 @@
 		"microphone": "Microphone",
 		"camera": "Camera",
 		"cursorHighlight": "Cursor highlight",
+		"autoZoom": "Auto-zoom after recording",
+		"autoZoomNeedsEditableCursor": "Auto-zoom needs the editable cursor. Switch cursor mode to enable.",
 		"on": "On",
 		"off": "Off",
 		"loading": "Loading…",
@@ -132,27 +140,24 @@
 		"emptyHint": "No media yet — import a recording to get started.",
 		"importMedia": "Import media",
 		"added": "Added {{label}}",
+		"addToTimeline": "Add to timeline",
+		"addedToTimeline": "Added {{label}} to the timeline",
 		"sourceTranscript": "Source Transcript",
 		"close": "Close",
 		"transcriptReady": "Transcript ready",
 		"transcribing": "Transcribing",
 		"downloadingModel": "Downloading speech model",
-		"transcribingEllipsis": "Transcribing…",
+		"initializingModel": "Starting speech model",
 		"pendingTranscription": "Pending transcription",
 		"transcriptionFailed": "Transcription failed",
+		"cpuBackendHint": "Running on CPU — about 2× slower than on the GPU",
 		"noTranscript": "No transcript",
-		"notGeneratedYet": "Not generated yet",
 		"regenerateAs": "Regenerate as",
 		"auto": "Auto",
 		"regenerate": "Regenerate",
 		"transcriptEmpty": "Transcript is empty.",
 		"notGeneratedHint": "Not generated yet — pick a language and click regenerate.",
-		"generating": "Generating",
-		"generationFailed": "Generation failed",
-		"generated": "Generated",
 		"generationFailedHint": "Generation failed — pick a language and regenerate.",
-		"noPreviewAvailable": "No preview available",
-		"restart": "Restart",
 		"detectedLanguage": "Detected language: {{language}}",
 		"noAudioTrack": "No audio track",
 		"noAudioTrackHint": "This media has no audio track — there is nothing to transcribe.",
@@ -209,18 +214,6 @@
 		"deleteRegion": "Delete region",
 		"freehandRendersAsBox": "In the export, a freehand shape is covered by its bounding box — over-covered, never under."
 	},
-	"leftPanel": {
-		"mediaTitle": "Media",
-		"searchPlaceholder": "Search…",
-		"clearSearch": "Clear search",
-		"emptyHint": "No media in this project yet. Import a video below.",
-		"transcriptReadyBadge": "TRANSCRIPT READY"
-	},
-	"leftRail": {
-		"chat": "Chat",
-		"media": "Media",
-		"ariaLabel": "Left tools"
-	},
 	"chat": {
 		"changeProvider": "Change provider",
 		"back": "Back",
@@ -235,6 +228,8 @@
 		"selectModelFailed": "Could not select model",
 		"providerSettings": "Provider settings…",
 		"applyEditsFailed": "Could not apply the agent's edits",
+		"agentEditConflict": "Agent edits were not applied because the project changed while it was working.",
+		"applyAnyway": "Apply anyway",
 		"chatFailed": "Chat failed",
 		"rewindFailed": "Rewind failed",
 		"rewoundSuccess": "Rewound to the start of that message",
@@ -281,7 +276,7 @@
 		"sendTitle": "Send (Enter)",
 		"send": "Send",
 		"rewindConfirmTitle": "Rewind here?",
-		"rewindConfirmBody": "The agent's edits and follow-up turns after this point get rolled back. Project, conversation, and agent state will be restored.",
+		"rewindConfirmBody": "The agent's edits and follow-up turns after this point get rolled back. Project, conversation, and agent state will be restored. Any edits you made since then are replaced too.",
 		"rewindConfirm": "Rewind",
 		"configureModel": "Configure AI Model",
 		"historyDialog": {
@@ -311,7 +306,9 @@
 		"noMatches": "No projects match \"{{query}}\".",
 		"navigateHint": "to navigate ·",
 		"openHint": "to open",
-		"browseFiles": "Browse files…"
+		"browseFiles": "Browse files…",
+		"deleteProject": "Delete project",
+		"confirmDelete": "Delete this project? Your recordings are kept."
 	},
 	"editClipDialog": {
 		"title": "Edit clip",
@@ -359,7 +356,13 @@
 	},
 	"preview": {
 		"videoPreview": "Video preview",
-		"webcamPreview": "Webcam preview (drag to reposition)"
+		"webcamPreview": "Webcam preview (drag to reposition)",
+		"mediaError": {
+			"title": "Preview stopped",
+			"description": "The video couldn't be decoded. The file may be damaged, still being written, or no longer where the project expects it — your project itself is intact.",
+			"retry": "Try again",
+			"detail": "Details: {{detail}}"
+		}
 	},
 	"annotationOverlay": {
 		"imageAlt": "Annotation",

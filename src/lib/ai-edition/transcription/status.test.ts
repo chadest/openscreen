@@ -2,10 +2,17 @@ import { describe, expect, it } from "vitest";
 import type { AxcutDocument, AxcutTranscript } from "../schema";
 import {
 	type AssetTranscriptionView,
+	assetCanCarrySpeech,
 	classifyTranscriptionError,
 	deriveAssetStatus,
+	firstBusyView,
+	firstTimelineBusyView,
+	isCpuBackend,
+	isModelDownloadInFlight,
 	isPermanentFailure,
+	isSilentFailure,
 	progressFraction,
+	realtimeSpeed,
 	resolveTranscriptGate,
 	transcriptHasSpeech,
 	transcriptRelevantAssetIds,
@@ -58,12 +65,35 @@ describe("classifyTranscriptionError", () => {
 		).toBe("no-audio");
 	});
 
+	// The native extractor phrases it its own way, and `ipcRenderer.invoke` wraps
+	// the rejection before the renderer ever sees it — this is the shape that
+	// reached `classifyTranscriptionError` in issue #628 and fell through to
+	// "error", turning a muted screen recording into a failed job.
+	it("recognises the native extractor's verdict, through the IPC wrapper", () => {
+		const failure = classifyTranscriptionError(
+			new Error(
+				"Error invoking remote method 'stt:transcribe': Error: No decodable audio in /rec.mp4: Output file #0 does not contain any stream",
+			),
+		);
+		expect(failure.kind).toBe("no-audio");
+		expect(isPermanentFailure(failure.kind)).toBe(true);
+	});
+
 	it("recognises an audio codec the caption path cannot read", () => {
 		const failure = classifyTranscriptionError(
 			new Error("Audio codec not supported for captions: ac-3"),
 		);
 		expect(failure.kind).toBe("unsupported-audio");
 		expect(isPermanentFailure(failure.kind)).toBe(true);
+	});
+
+	it("marks the media verdicts as silent, and an engine failure as not", () => {
+		expect(isSilentFailure(view("a", "failed", "no-audio"))).toBe(true);
+		expect(isSilentFailure(view("a", "failed", "unsupported-audio"))).toBe(true);
+		expect(isSilentFailure(view("a", "failed", "error"))).toBe(false);
+		// A stored transcript outranks a failed job (`deriveAssetStatus`), and that
+		// view still carries the failure — it must not be styled as silence.
+		expect(isSilentFailure(view("a", "ready", "no-audio"))).toBe(false);
 	});
 
 	it("treats anything else as a transient error worth retrying", () => {
@@ -228,53 +258,54 @@ describe("resolveTranscriptGate", () => {
 	});
 });
 
-describe("transcriptRelevantAssetIds", () => {
-	const base = {
-		schemaVersion: 7 as const,
-		project: {
-			id: "proj_1",
-			title: "T",
-			createdAt: "2026-06-25T10:00:00.000Z",
-			updatedAt: "2026-06-25T10:00:00.000Z",
-		},
-		transcript: null,
-		transcripts: [],
-		annotations: [],
-		zoomRanges: [],
-		legacyEditor: null,
-	};
+const base = {
+	schemaVersion: 7 as const,
+	project: {
+		id: "proj_1",
+		title: "T",
+		createdAt: "2026-06-25T10:00:00.000Z",
+		updatedAt: "2026-06-25T10:00:00.000Z",
+	},
+	transcript: null,
+	transcripts: [],
+	annotations: [],
+	zoomRanges: [],
+	audioTracks: [],
+	legacyEditor: null,
+};
 
-	function doc(assetIds: string[], clipAssetIds: string[]): AxcutDocument {
-		return {
-			...base,
-			assets: assetIds.map((id) => ({
-				id,
-				kind: "video" as const,
-				label: id,
-				originalPath: `/tmp/${id}.mp4`,
-				cameraTrack: null,
+function doc(assetIds: string[], clipAssetIds: string[]): AxcutDocument {
+	return {
+		...base,
+		assets: assetIds.map((id) => ({
+			id,
+			kind: "video" as const,
+			label: id,
+			originalPath: `/tmp/${id}.mp4`,
+			cameraTrack: null,
+		})),
+		timeline: {
+			clips: clipAssetIds.map((assetId, i) => ({
+				id: `clip_${i}`,
+				assetId,
+				sourceStartSec: 0,
+				sourceEndSec: 10,
+				timelineStartSec: i * 10,
+				timelineEndSec: i * 10 + 10,
+				wordRefs: [],
+				origin: "system" as const,
+				reason: "",
 			})),
-			timeline: {
-				clips: clipAssetIds.map((assetId, i) => ({
-					id: `clip_${i}`,
-					assetId,
-					sourceStartSec: 0,
-					sourceEndSec: 10,
-					timelineStartSec: i * 10,
-					timelineEndSec: i * 10 + 10,
-					wordRefs: [],
-					origin: "system" as const,
-					reason: "",
-				})),
-				gaps: [],
-				trimRanges: [],
-				muteRanges: [],
-				speedRanges: [],
-				captionRanges: [],
-			},
-		} as AxcutDocument;
-	}
+			gaps: [],
+			trimRanges: [],
+			muteRanges: [],
+			speedRanges: [],
+			captionRanges: [],
+		},
+	} as AxcutDocument;
+}
 
+describe("transcriptRelevantAssetIds", () => {
 	it("only counts the assets the timeline plays", () => {
 		expect(transcriptRelevantAssetIds(doc(["a", "b"], ["a", "a"]))).toEqual(["a"]);
 	});
@@ -289,5 +320,153 @@ describe("transcriptRelevantAssetIds", () => {
 
 	it("has nothing to say about a missing document", () => {
 		expect(transcriptRelevantAssetIds(null)).toEqual([]);
+	});
+});
+
+describe("firstTimelineBusyView", () => {
+	it("ignores a busy job on an asset the timeline does not play", () => {
+		// "b" is in the bin and mid-transcription, but the timeline only plays
+		// "a" — the timeline-scoped label must stay idle, like the gate does.
+		const views = { b: view("b", "running") };
+		expect(firstTimelineBusyView(doc(["a", "b"], ["a"]), views)).toBeUndefined();
+	});
+
+	it("reports a busy job on a timeline asset", () => {
+		const views = { a: view("a", "running"), b: view("b", "running") };
+		expect(firstTimelineBusyView(doc(["a", "b"], ["a"]), views)?.assetId).toBe("a");
+	});
+
+	it("keeps the empty-timeline fallback: whole-bin jobs count", () => {
+		const views = { b: view("b", "queued") };
+		expect(firstTimelineBusyView(doc(["a", "b"], []), views)?.assetId).toBe("b");
+	});
+
+	it("is quiet when nothing relevant is busy", () => {
+		const views = { a: view("a", "ready") };
+		expect(firstTimelineBusyView(doc(["a"], ["a"]), views)).toBeUndefined();
+	});
+});
+
+describe("realtimeSpeed", () => {
+	// The engine reports RTF (wall-clock / audio, lower is faster); the UI shows
+	// its reciprocal, which is the figure the POC report headlines.
+	it("inverts the engine's RTF into x-real-time", () => {
+		expect(realtimeSpeed(0.5)).toBe(2);
+		expect(realtimeSpeed(0.19)).toBeCloseTo(5.26, 2);
+	});
+
+	// Null rather than 0: a helper binary older than the `timing` field reports
+	// nothing at all, and "0.0x" would read as a measurement rather than a gap.
+	it.each([
+		["undefined", undefined],
+		["zero", 0],
+		["negative", -1],
+		["NaN", Number.NaN],
+		["Infinity", Number.POSITIVE_INFINITY],
+	])("has no answer for %s", (_label, rtf) => {
+		expect(realtimeSpeed(rtf)).toBeNull();
+	});
+});
+
+describe("isCpuBackend", () => {
+	it("singles out the CPU path and nothing else", () => {
+		expect(isCpuBackend("whispercpp-cpu")).toBe(true);
+		expect(isCpuBackend("whispercpp-vulkan")).toBe(false);
+		expect(isCpuBackend("whispercpp-metal")).toBe(false);
+		expect(isCpuBackend("whispercpp-cuda")).toBe(false);
+		expect(isCpuBackend(undefined)).toBe(false);
+	});
+});
+
+describe("model download bytes", () => {
+	it("is in-flight only when totalBytes is positive and download is incomplete", () => {
+		expect(isModelDownloadInFlight({ downloadedBytes: 10, totalBytes: 100 })).toBe(true);
+		expect(isModelDownloadInFlight({ downloadedBytes: 100, totalBytes: 100 })).toBe(false);
+		expect(isModelDownloadInFlight({})).toBe(false);
+	});
+
+	it("prefers a running view over a queued one for pane copy", () => {
+		const busy = firstBusyView([
+			view("a", "queued"),
+			{ assetId: "b", status: "running", phase: "loading-model" },
+		]);
+		expect(busy?.assetId).toBe("b");
+	});
+});
+
+describe("deriveAssetStatus carries the engine's own report", () => {
+	// Both facts come from the main process on the chunk status events, and the
+	// view is the only thing the three status surfaces read.
+	it("passes the running job's backend and rtf onto the view", () => {
+		const derived = deriveAssetStatus({
+			assetId: "a",
+			job: { status: "running", backend: "whispercpp-cpu", rtf: 1.1 },
+		});
+		expect(derived.backend).toBe("whispercpp-cpu");
+		expect(derived.rtf).toBe(1.1);
+	});
+
+	// A finished run's transcript says nothing about the device that produced it,
+	// so the view must not carry a stale badge over a "ready" asset.
+	it("drops them once a transcript exists", () => {
+		const derived = deriveAssetStatus({
+			assetId: "a",
+			job: { status: "failed", backend: "whispercpp-cpu", rtf: 1.1 },
+			transcript: transcript("a", ["hello"]),
+		});
+		expect(derived.status).toBe("ready");
+		expect(derived.backend).toBeUndefined();
+		expect(derived.rtf).toBeUndefined();
+	});
+});
+
+describe("assetCanCarrySpeech", () => {
+	/** A document with one video asset and one imported audio asset. */
+	const doc = (audioTracks: Array<Record<string, unknown>>) =>
+		({
+			assets: [
+				{ id: "vid", kind: "video" },
+				{ id: "aud", kind: "audio" },
+			],
+			audioTracks,
+		}) as unknown as Parameters<typeof assetCanCarrySpeech>[0];
+
+	const track = (kind: "voiceover" | "music", assetId = "aud") => ({
+		id: `t_${kind}`,
+		assetId,
+		kind,
+	});
+
+	it("says yes to footage without consulting the timeline", () => {
+		// Video is the case that always carried speech; the guard must not regress it.
+		expect(assetCanCarrySpeech(doc([]), "vid")).toBe(true);
+	});
+
+	it("says yes to an audio asset played on a voiceover lane", () => {
+		expect(assetCanCarrySpeech(doc([track("voiceover")]), "aud")).toBe(true);
+	});
+
+	it("says no to a music bed", () => {
+		// The whole point: 35s of inference at editor open, to transcribe music.
+		expect(assetCanCarrySpeech(doc([track("music")]), "aud")).toBe(false);
+	});
+
+	it("says yes when the same file is on both lanes", () => {
+		// One voiceover placement is enough — the file demonstrably carries speech,
+		// whatever else it is also used for.
+		expect(assetCanCarrySpeech(doc([track("music"), track("voiceover")]), "aud")).toBe(true);
+	});
+
+	it("says no to an audio asset no region plays", () => {
+		// Nothing is asking for it, so nothing should pay for it.
+		expect(assetCanCarrySpeech(doc([]), "aud")).toBe(false);
+	});
+
+	it("ignores regions playing a different file", () => {
+		expect(assetCanCarrySpeech(doc([track("voiceover", "other")]), "aud")).toBe(false);
+	});
+
+	it("says no to an asset that is not in the document", () => {
+		expect(assetCanCarrySpeech(doc([]), "ghost")).toBe(false);
 	});
 });

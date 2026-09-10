@@ -29,6 +29,7 @@ const baseDoc: AxcutDocument = {
 	},
 	annotations: [],
 	zoomRanges: [],
+	audioTracks: [],
 	transcripts: [],
 	transcript: null,
 	legacyEditor: null,
@@ -142,5 +143,131 @@ describe("patchEditorSettings", () => {
 		};
 		const snap = getEditorSettings(doc);
 		expect(snap.webcamPosition).toEqual({ cx: 1, cy: 0 });
+	});
+
+	it("preserves a non-zero crop at the bottom-right edge", () => {
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: { webcamCropRegion: { x: 1, y: 1, width: 0.5, height: 0.5 } },
+		};
+
+		const crop = getEditorSettings(doc).webcamCropRegion;
+		expect(crop.x).toBeCloseTo(0.99);
+		expect(crop.y).toBeCloseTo(0.99);
+		expect(crop.width).toBeCloseTo(0.01);
+		expect(crop.height).toBeCloseTo(0.01);
+	});
+
+	// Every project on disk today carries a crop rect and no pan, because the pan did not
+	// exist when they were saved. Recovering it from the rect is what keeps opening one a
+	// no-op; defaulting to centred would quietly reframe all of them.
+	it("recovers the pan of a crop authored before the pan was stored", () => {
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: { webcamCropRegion: { x: 0.375, y: 0, width: 0.5, height: 0.5 } },
+		};
+
+		const snap = getEditorSettings(doc);
+		// 0.375 of the 0.5 the crop leaves free is three quarters of the way across.
+		expect(snap.webcamCropPan.x).toBeCloseTo(0.75);
+		expect(snap.webcamCropPan.y).toBeCloseTo(0);
+		// And the rect comes back exactly as it went in — this is the identity that makes
+		// the change invisible to an existing document.
+		expect(snap.webcamCropRegion.x).toBeCloseTo(0.375);
+		expect(snap.webcamCropRegion.y).toBeCloseTo(0);
+	});
+
+	it("reads a full-frame crop as centred, since it has no room to sit in", () => {
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: { webcamCropRegion: { x: 0, y: 0, width: 1, height: 1 } },
+		};
+
+		expect(getEditorSettings(doc).webcamCropPan).toEqual({ x: 0.5, y: 0.5 });
+	});
+
+	it("rebuilds the crop's offset from the pan when the two disagree on disk", () => {
+		// The pan is authoritative: a rect whose offset contradicts it is a half-written
+		// pair, and the pan is the half that carries intent.
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: {
+				webcamCropRegion: { x: 0, y: 0, width: 0.5, height: 0.5 },
+				webcamCropPan: { x: 1, y: 0.5 },
+			},
+		};
+
+		const crop = getEditorSettings(doc).webcamCropRegion;
+		expect(crop.x).toBeCloseTo(0.5);
+		expect(crop.y).toBeCloseTo(0.25);
+		expect(crop.width).toBeCloseTo(0.5);
+	});
+
+	it("clamps a stored pan that is out of range", () => {
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: {
+				webcamCropRegion: { x: 0, y: 0, width: 0.5, height: 0.5 },
+				webcamCropPan: { x: 5, y: -2 },
+			},
+		};
+
+		const snap = getEditorSettings(doc);
+		expect(snap.webcamCropPan).toEqual({ x: 1, y: 0 });
+		// And the rect that follows from it still sits inside the frame.
+		expect(snap.webcamCropRegion.x).toBeCloseTo(0.5);
+		expect(snap.webcamCropRegion.y).toBeCloseTo(0);
+	});
+
+	it("falls back per axis when only one of the pan's coordinates is usable", () => {
+		// A half-written or hand-edited pan must not drag the good axis down with it: each
+		// coordinate recovers from the rect on its own.
+		const doc: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: {
+				webcamCropRegion: { x: 0.375, y: 0.125, width: 0.5, height: 0.5 },
+				webcamCropPan: { x: "left", y: 0.9 } as unknown as { x: number; y: number },
+			},
+		};
+
+		const snap = getEditorSettings(doc);
+		// x is unusable, so it comes back from the rect: 0.375 of the 0.5 free is 0.75.
+		expect(snap.webcamCropPan.x).toBeCloseTo(0.75);
+		// y is a number, so it is kept — and 0.9 is deliberately NOT what the rect implies
+		// (0.125 of 0.5 free would be 0.25), so this fails if the axes are not independent.
+		expect(snap.webcamCropPan.y).toBeCloseTo(0.9);
+		// The rect then follows each axis from its own resolved pan.
+		expect(snap.webcamCropRegion.x).toBeCloseTo(0.375);
+		expect(snap.webcamCropRegion.y).toBeCloseTo(0.45);
+	});
+
+	it("round-trips webcam background settings through legacyEditor", () => {
+		const patched = patchEditorSettings(baseDoc, {
+			webcamBackgroundMode: "custom",
+			webcamWallpaper: "#ff0080",
+			webcamBlurIntensity: 0.8,
+		});
+		const snap = getEditorSettings(patched);
+		expect(snap.webcamBackgroundMode).toBe("custom");
+		expect(snap.webcamWallpaper).toBe("#ff0080");
+		expect(snap.webcamBlurIntensity).toBe(0.8);
+	});
+
+	// `legacyEditor` is user-writable JSON. An unknown mode used to flow straight through
+	// as a WebcamBackgroundMode, so the export pre-render ran and `renderSegmentedWebcam`
+	// matched no branch — encoding a blank webcam track.
+	it("falls back to the default when the stored webcam background mode is unknown", () => {
+		const doc = {
+			...baseDoc,
+			legacyEditor: { webcamBackgroundMode: "hologram" },
+		} as typeof baseDoc;
+		expect(getEditorSettings(doc).webcamBackgroundMode).toBe("none");
+	});
+
+	it("clamps a stored webcam blur intensity into 0..1", () => {
+		const tooHigh = { ...baseDoc, legacyEditor: { webcamBlurIntensity: 1000 } } as typeof baseDoc;
+		expect(getEditorSettings(tooHigh).webcamBlurIntensity).toBe(1);
+		const negative = { ...baseDoc, legacyEditor: { webcamBlurIntensity: -3 } } as typeof baseDoc;
+		expect(getEditorSettings(negative).webcamBlurIntensity).toBe(0);
 	});
 });

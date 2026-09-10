@@ -1,10 +1,12 @@
 import {
-	ChevronDown,
+	AudioLines,
 	Clock,
 	Crosshair,
 	Loader2,
 	Maximize2,
 	MessageSquare,
+	Mic,
+	Music,
 	Pencil,
 	Scissors,
 	Sparkles,
@@ -14,7 +16,7 @@ import {
 	ZoomIn,
 } from "lucide-react";
 import {
-	type CSSProperties,
+	Fragment,
 	memo,
 	type PointerEvent as ReactPointerEvent,
 	useCallback,
@@ -25,19 +27,33 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { fromFileUrl } from "@/components/video-editor/projectPersistence";
+import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
+import { toFileUrl } from "@/components/video-editor/projectPersistence";
 import { ZOOM_DEPTH_SCALES } from "@/components/video-editor/types";
 import { useScopedT } from "@/contexts/I18nContext";
+import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { useAudioPeaks } from "@/hooks/useAudioPeaks";
+import {
+	AUDIO_LANE_PAD_PX,
+	AUDIO_ROW_GAP_PX,
+	AUDIO_ROW_HEIGHT_PX,
+	audioGhostExtent,
+	collapseTracksToPills,
+	packAudioTrackRows,
+	slipAudioOffsetMs,
+} from "@/lib/ai-edition/document/audioTracks";
 import { createId } from "@/lib/ai-edition/document/ids";
-import { collectNativeFormats } from "@/lib/ai-edition/document/outputFormat";
+import { isGeneratedAssetId } from "@/lib/ai-edition/document/insertion";
 import { setUiProbeScrubbing } from "@/lib/ai-edition/perf/uiFrameProbe";
-import type { AxcutClip } from "@/lib/ai-edition/schema";
+import type { AxcutAudioTrack, AxcutClip } from "@/lib/ai-edition/schema";
+import { audioGainScalar } from "@/lib/ai-edition/store/editorSettings";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import { useTimelineTranscriptGate } from "@/lib/ai-edition/store/transcriptionStore";
 import { useChatPromptBus } from "@/lib/ai-edition/store/useChatPromptBus";
 import { useEditorSettings } from "@/lib/ai-edition/store/useEditorSettings";
 import type { useTimeline } from "@/lib/ai-edition/store/useTimeline";
+import { collectAutoZoomSuggestionsForLatestDocument } from "@/lib/ai-edition/timeline/apply-auto-zooms";
+import { hasAnyClipWithCamera } from "@/lib/ai-edition/timeline/camera";
 import { formatSec } from "@/lib/ai-edition/timeline/format";
 import {
 	newRegionDurationSec,
@@ -50,12 +66,8 @@ import {
 	resolveTimelineSpanToTrim,
 	ventilateTimelineSpanToTrims,
 } from "@/lib/ai-edition/timeline/trim-mapping";
-import {
-	type AutoZoomSuggestion,
-	buildAutoZoomSuggestionsForClips,
-} from "@/lib/ai-edition/timeline/zoom-suggestions";
+import { formatBinding } from "@/lib/shortcuts";
 import { nativeBridgeClient } from "@/native/client";
-import { ASPECT_RATIO_PRESETS, getAspectRatioLabel } from "@/utils/aspectRatioUtils";
 import { TransportBar } from "../TransportBar";
 import type { VideoSource } from "../VirtualPreview";
 import styles from "./EditorShellV4.module.css";
@@ -129,12 +141,17 @@ const PILL_HANDLE_OUT_PX = PILL_HANDLE_PX + PILL_MOVE_GAP_PX;
 const PILL_CONTENT_MIN_PX = 34;
 /** Edge-snap radius while dragging a pill, in screen px. */
 const PILL_SNAP_PX = 8;
+// One audio pill's height, the vertical step between stacked rows, and lane padding
+// are defined in audioTracks.ts and imported above.
 // The size a newly created pill aims for (PILL_CREATE_PX) lives in
 // timeline/newRegionDuration, because the keyboard shortcuts create regions too
 // and they are handled in NewEditorShell, outside this component.
 /** Visual separation between two clip cards. Taken off each clip's own width
  *  (see .tlClip) rather than inserted between them, so it cannot displace the
  *  clips that follow — which is what a flex `gap` did, once per junction. */
+/** Below this a clip cannot show a label and a delete button inside itself. */
+const NARROW_CLIP_PX = 120;
+
 const CLIP_GUTTER_PX = 6;
 /**
  * Shortest region a resize may leave behind — the storage grid itself (regions
@@ -258,11 +275,18 @@ const ClipWaveform = memo(function ClipWaveform({
 	assetDurationSec,
 	sourceStartSec,
 	sourceEndSec,
+	gain,
 }: {
 	videoUrl: string | undefined;
 	assetDurationSec: number | undefined;
 	sourceStartSec: number;
 	sourceEndSec: number;
+	/** Linear output gain — `audioGainScalar(settings.audioGainDb)`, not the dB.
+	 *  Passed in rather than read from the settings store here: this component is
+	 *  memoised per clip, and subscribing each one to the document would re-render
+	 *  every waveform on any edit at all. As a prop it busts the memo on a gain
+	 *  change and on nothing else. */
+	gain: number;
 }) {
 	// The duration is what tells `useAudioPeaks` whether this recording is small
 	// enough to decode whole — the file's byte size does not, on compressed video.
@@ -301,40 +325,200 @@ const ClipWaveform = memo(function ClipWaveform({
 	if (!bars) return null;
 	return (
 		<div aria-hidden className={styles.tlWave}>
-			{bars.map((h, bi) => (
-				<span
-					key={bi}
-					style={{
-						height: `${Math.max(8, Math.round(h * 100))}%`,
-						opacity: (0.5 + h * 0.5).toFixed(2),
-					}}
-				/>
-			))}
+			{bars.map((h, bi) => {
+				// Gain is applied HERE and not inside the memo above, which scans the whole
+				// asset's blocks: a slider drag fires one setLive per pointer move, so this
+				// keeps a tick at `barCount` multiplies instead of re-folding the peaks.
+				//
+				// Clamped because `finish_audio` clamps: it does `(sample * trim).clamp(-1, 1)`
+				// per sample, and this bar is `max|sample|` over its bucket. Gain is positive
+				// and clamping is monotonic, so `clamp(max(|s|) * g)` IS the peak of the gained,
+				// clipped signal — the bar is exact, not an impression. Without the clamp a
+				// 0.5 peak at +12 dB computes `height: 199%` and is merely hidden by the clip's
+				// `overflow`, which draws a signal the export will never write.
+				//
+				// The 8% floor is deliberately NOT scaled: it exists so an empty clip still
+				// reads as a clip, and it is not amplitude.
+				const amplitude = Math.min(1, h * gain);
+				return (
+					<span
+						key={bi}
+						style={{
+							height: `${Math.max(8, Math.round(amplitude * 100))}%`,
+							opacity: (0.5 + amplitude * 0.5).toFixed(2),
+						}}
+					/>
+				);
+			})}
 		</div>
 	);
 });
 
-/** Right-aligned hint on a ratio row. Marks the shapes that are native to the timeline's own
- *  clips, so "Original" annotates a concrete ratio the user can name instead of being a separate
- *  menu entry that resolves to a different shape depending on which clips are loaded. */
-const nativeBadgeStyle: CSSProperties = {
-	marginLeft: "auto",
-	fontSize: 10.5,
-	fontWeight: 500,
-	color: "var(--muted)",
-	whiteSpace: "nowrap",
-};
-
-/** Header for native shapes that match no preset (an ultrawide, an odd capture size) and so
- *  need a row of their own. */
-const aspectSectionLabelStyle: CSSProperties = {
-	padding: "8px 10px 4px",
-	fontSize: 10,
-	fontWeight: 600,
-	letterSpacing: "0.04em",
-	textTransform: "uppercase",
-	color: "var(--muted)",
-};
+// One imported audio track on its lane (issue #350). Grab the body to move it,
+// the edge handles to trim (left = in-point, which moves the head too; right =
+// out-point). The waveform reuses ClipWaveform (its `.tlWave` is inset:0, so it
+// paints behind the label here just as it does inside a clip), windowed to the
+// track's trim and scaled by the track's own gain. `leftPct`/`widthPct` are
+// precomputed by the parent — during a drag they carry the live preview geometry
+// — so this stays memoisable: a doc edit that doesn't touch this track, and a
+// drag on another one, won't re-render it.
+const AudioLanePill = memo(function AudioLanePill({
+	track,
+	url,
+	assetDurationSec,
+	leftPct,
+	widthPct,
+	sourceStartSec,
+	sourceEndSec,
+	spanSec,
+	loopWindowSec,
+	row,
+	rowHeight,
+	selected,
+	onStartDrag,
+	onSelect,
+	label,
+	slipHint,
+	slipArmed,
+	outputGain,
+	ghost,
+}: {
+	track: AxcutAudioTrack;
+	url: string | undefined;
+	assetDurationSec: number | undefined;
+	leftPct: number;
+	widthPct: number;
+	/** The slice of the source the pill is showing — the track's offset and its
+	 *  span, or the live window while an edge is being dragged. */
+	sourceStartSec: number;
+	sourceEndSec: number;
+	/** The pill's own length in seconds, and how much source one repeat plays —
+	 *  together they say where the loop boundaries fall. */
+	spanSec: number;
+	loopWindowSec: number;
+	/** Which row of the audio lane this pill occupies, and how tall a row is —
+	 *  overlapping tracks are stacked rather than drawn on top of each other. */
+	row: number;
+	rowHeight: number;
+	selected: boolean;
+	onStartDrag: (e: ReactPointerEvent, track: AxcutAudioTrack, mode: "move" | "l" | "r") => void;
+	onSelect: (id: string) => void;
+	label: string;
+	/** Appended to the pill's tooltip. A modifier is never discoverable on its own —
+	 *  you either read it somewhere or you never find it — and the tooltip is where a
+	 *  user already looks to ask what a thing does. */
+	slipHint: string;
+	/** True while Alt is held, so the pill can say the next drag will slip rather than
+	 *  move. Confirms the modifier; the tooltip is what teaches it. */
+	slipArmed: boolean;
+	/** Linear project output gain, applied on top of the track gain — the mixer
+	 *  applies both, so the bars must too or they under-read the exported level. */
+	outputGain: number;
+	/** Where the rest of the file sits around the pill, as percentages of the canvas
+	 *  and the source window it covers. Absent when there is nothing to show. */
+	ghost?: {
+		leftPct: number;
+		widthPct: number;
+		sourceStartSec: number;
+		sourceEndSec: number;
+	} | null;
+}) {
+	const duration = assetDurationSec ?? track.durationSec;
+	return (
+		<>
+			{/* The rest of the tape, dimmed and unclickable, behind the pill — so the pill
+			    reads as a window onto it and an edge drag shows what is still available on
+			    each side before it hits the stop. Same height and row as the pill: a ghost
+			    that does not line up reads as a separate object sitting behind it. */}
+			{ghost ? (
+				<div
+					aria-hidden
+					className={styles.lanePillGhost}
+					style={{
+						left: `${ghost.leftPct}%`,
+						width: `${ghost.widthPct}%`,
+						top: AUDIO_LANE_PAD_PX + row * rowHeight,
+						height: AUDIO_ROW_HEIGHT_PX,
+					}}
+				>
+					<ClipWaveform
+						videoUrl={url}
+						assetDurationSec={duration}
+						sourceStartSec={ghost.sourceStartSec}
+						sourceEndSec={ghost.sourceEndSec}
+						gain={audioGainScalar(track.gainDb) * outputGain}
+					/>
+				</div>
+			) : null}
+			<div
+				role="button"
+				tabIndex={0}
+				className={`${styles.lanePill} ${styles.laneAudio}${
+					selected ? ` ${styles.lanePillSel}` : ""
+				}${slipArmed ? ` ${styles.laneAudioSlip}` : ""}`}
+				style={{
+					left: `${leftPct}%`,
+					width: `${widthPct}%`,
+					minWidth: 3,
+					top: AUDIO_LANE_PAD_PX + row * rowHeight,
+					height: AUDIO_ROW_HEIGHT_PX,
+				}}
+				// Body drag moves the track; it also selects and stops the .tlTracks scrub.
+				onPointerDown={(e) => onStartDrag(e, track, "move")}
+				onKeyDown={(e) => {
+					if (e.key !== "Enter" && e.key !== " ") return;
+					e.preventDefault();
+					// The shell binds Space to play/pause on `window`, above React's root, so
+					// stopping only the synthetic event selects the pill and toggles playback in
+					// the same keystroke. Same fix as the region pill below.
+					e.nativeEvent.stopPropagation();
+					onSelect(track.id);
+				}}
+				title={`${label} — ${slipHint}`}
+			>
+				<span
+					className={styles.lanePillHandle}
+					style={{ left: 0 }}
+					onPointerDown={(e) => onStartDrag(e, track, "l")}
+				/>
+				<ClipWaveform
+					videoUrl={url}
+					assetDurationSec={duration}
+					sourceStartSec={sourceStartSec}
+					sourceEndSec={sourceEndSec}
+					// Track gain AND the project output gain — `finish_audio` applies both and
+					// clamps, so scaling by the track gain alone under-read a boosted output.
+					gain={audioGainScalar(track.gainDb) * outputGain}
+				/>
+				{/* Where the file starts over, so a looping bed reads as one deliberate
+			    repeat rather than a mystery. Only drawn when the pill actually
+			    outruns its source — otherwise there is nothing to repeat. */}
+				{track.loop && loopWindowSec > 0
+					? Array.from(
+							{ length: Math.min(200, Math.ceil(spanSec / loopWindowSec) - 1) },
+							(_, i) => (
+								<span
+									key={`loop-${i + 1}`}
+									data-testid="audio-loop-mark"
+									className={styles.laneLoopMark}
+									style={{ left: `${(((i + 1) * loopWindowSec) / spanSec) * 100}%` }}
+								/>
+							),
+						)
+					: null}
+				<span className={styles.laneAudioLabel}>
+					<Music size={11} />
+					{label}
+				</span>
+				<span
+					className={styles.lanePillHandle}
+					style={{ right: 0 }}
+					onPointerDown={(e) => onStartDrag(e, track, "r")}
+				/>
+			</div>
+		</>
+	);
+});
 
 interface LanePill {
 	id: string;
@@ -357,11 +541,12 @@ export function V4Timeline({
 	onPrevClip,
 	onNextClip,
 	onEditClip,
+	onAddVoiceover,
 }: {
 	tl: TimelineApi;
 	setCurrentTime: (sec: number) => void;
 	variant?: "edit" | "media";
-	onDropAsset?: (assetId: string) => void;
+	onDropAsset?: (assetId: string) => Promise<void>;
 	videoSources?: VideoSource[];
 	playing: boolean;
 	onTogglePlay: () => void;
@@ -370,8 +555,21 @@ export function V4Timeline({
 	/** Opens the (now single, shell-level) EditClipModal for this clip —
 	 * trim in/out and crop both live there per-clip. */
 	onEditClip: (clip: AxcutClip) => void;
+	/** Opens the voiceover recorder. Shell-level like the clip editor: the
+	 *  dialog owns the microphone and the shell owns the transport. */
+	onAddVoiceover: () => void;
 }) {
 	const t = useScopedT("timeline");
+	// The live bindings, not the defaults: these keys are remappable, and a menu
+	// that taught the wrong one would be worse than teaching none.
+	const { shortcuts, isMac } = useShortcuts();
+	// The camera lane borrows the Layout pane's "No Webcam" wording when there is no
+	// camera to grow, so the two surfaces say the same thing about the same project.
+	const ts = useScopedT("settings");
+	// Wheel zoom/pan listens on the whole pane (toolbar down through the nav bar),
+	// not just the lanes — a user scrolling over the ruler or the hint labels
+	// expects the same zoom/pan the lanes give, not silence.
+	const panelRef = useRef<HTMLDivElement | null>(null);
 	const tracksRef = useRef<HTMLDivElement | null>(null);
 	// The transformed canvas is the true timeline coordinate frame — clips, pills
 	// and the playhead are all positioned inside it. Time↔x math must measure THIS
@@ -404,22 +602,9 @@ export function V4Timeline({
 		shiftPx: number;
 	} | null>(null);
 	const { settings, set: setSettings } = useEditorSettings();
-	const document = useProjectStore((s) => s.document);
-	// The distinct native shapes of the clips actually on the timeline. "Original" used to be a
-	// single menu entry that silently resolved to whichever clip had the most pixels — so adding
-	// a 4K portrait rush flipped the whole project to portrait with no UI feedback. Enumerating
-	// them instead means the user picks a shape explicitly, and what gets stored is a concrete
-	// "W:H" token that no longer moves when the clip list changes.
-	const nativeFormats = useMemo(() => (document ? collectNativeFormats(document) : []), [document]);
-	// The ORIGINAL section lists every distinct shape actually on the timeline (deduplicated by
-	// ratio), so the user sees what their footage is — including shapes that also happen to match a
-	// preset. A preset row and its matching Original row select the same token; the preset section
-	// stays a pure list of fixed choices, and "which shapes are my clips" lives solely in ORIGINAL
-	// (no more per-preset badge, which split that one answer across two places).
-	const timelineIsMixed = nativeFormats.length > 1;
 
-	const [aspectMenuOpen, setAspectMenuOpen] = useState(false);
 	const [autoEnhanceOpen, setAutoEnhanceOpen] = useState(false);
+	const [audioMenuOpen, setAudioMenuOpen] = useState(false);
 	const [autoBusy, setAutoBusy] = useState(false);
 	// The AI cut pass reads the transcript, and the transcript is produced in the
 	// background (see transcriptionStore). Until it is there, the entry says why
@@ -441,6 +626,15 @@ export function V4Timeline({
 							: t("toolbar.smartCutsNeedsTranscript");
 
 	const clips = tl.clips;
+	// A camera-fullscreen region grows the webcam overlay, so on a project with no webcam
+	// it renders nothing in the preview and nothing in the export. `addCameraFullscreen`
+	// refuses to write one (see useTimeline) — this makes the control say so before it is
+	// clicked instead of looking like it worked. Same question, same helper as the Layout
+	// pane: is a camera attached anywhere on this timeline?
+	const hasAnyCamera = useMemo(() => hasAnyClipWithCamera(tl.assets, clips), [tl.assets, clips]);
+	// The pauses added words created, placed on the ruler. Everything below measures the
+	// EXPANDED ruler — stored clip geometry plus the time those pauses add — because that
+	// is the film's real length and the one the playhead runs along. Stored geometry is
 	const total = useMemo(
 		() =>
 			Math.max(
@@ -450,6 +644,8 @@ export function V4Timeline({
 		[clips],
 	);
 	const pctOf = useCallback((sec: number) => (sec / total) * 100, [total]);
+	/** Stored raw seconds → a percentage of the expanded ruler. */
+	const pctAt = pctOf;
 	const showLanes = variant === "edit";
 
 	// The visible fraction of the timeline, and what one second is worth on screen
@@ -511,6 +707,7 @@ export function V4Timeline({
 		label: `${(p.member.customScale ?? ZOOM_DEPTH_SCALES[p.member.depth]).toFixed(2)}×`,
 		sourceIds: p.ids,
 	}));
+
 	// trims: content-free (no per-instance text/settings), so touching rows —
 	// inevitable once a trim is ventilated across a clip boundary — are
 	// coalesced into one pill. This is what makes growing a trim across a
@@ -662,11 +859,18 @@ export function V4Timeline({
 	// Drag a lane pill to move it (mode "move", keeps duration) or resize one
 	// edge (mode "l"/"r"). Zoom/speed/annotation are timeline-ms; trims map
 	// back to source-seconds through their carrying clip.
+	const selectPill = useCallback(
+		(pill: LanePill, additive: boolean) => {
+			tl.selectRegion(pill.kind, pill.id, { additive });
+		},
+		[tl],
+	);
+
 	const startPillDrag = useCallback(
 		(e: ReactPointerEvent, pill: LanePill, dragMode: "move" | "l" | "r") => {
 			e.preventDefault();
 			e.stopPropagation();
-			tl.selectRegion(pill.kind, pill.id, { additive: e.shiftKey });
+			selectPill(pill, e.shiftKey);
 			// Scale drag deltas against the canvas (full zoomed timeline) width, so a
 			// drag tracks the cursor exactly regardless of padding, scrollbar or zoom.
 			const el = canvasRef.current;
@@ -778,7 +982,252 @@ export function V4Timeline({
 			window.addEventListener("pointermove", move);
 			window.addEventListener("pointerup", up);
 		},
-		[tl, total, clips, pxPerSec],
+		[tl, selectPill, total, clips, pxPerSec],
+	);
+
+	// Live preview geometry for an audio track being dragged (issue #350), the
+	// audio-lane counterpart of activePillDrag — see startAudioDrag. Times are
+	// output-timeline (start) and source (trimStart/trimEnd) seconds.
+	const [audioDrag, setAudioDrag] = useState<{
+		id: string;
+		start: number;
+		trimStart: number;
+		trimEnd: number;
+	} | null>(null);
+	const audioDragRef = useRef<typeof audioDrag>(null);
+	/** `in -> out / length` pinned to the pointer while an audio edge is pulled or the
+	 *  media is slipped under the pill. Rendered at the component root: the lane sits
+	 *  inside the zoomed canvas transform, which would scale a chip placed in it. */
+	const [audioDragTip, setAudioDragTip] = useState<{
+		x: number;
+		y: number;
+		inSec: number;
+		outSec: number;
+		durationSec: number;
+	} | null>(null);
+	// The user-visible tracks and their lane rows. Packed from the STORED spans,
+	// not the live drag geometry: a pill that changed rows halfway through a drag
+	// would jump out from under the pointer.
+	const audioPills = useMemo(() => collapseTracksToPills(tl.audioTracks), [tl.audioTracks]);
+	// One row per KIND, and the packer unchanged INSIDE each kind (issue #560). Placement
+	// now clamps same-kind pills apart, so intra-kind packing is the legacy escape hatch —
+	// it keeps a document written before that rule legible instead of stacking its pills on
+	// top of each other. A kind with no tracks takes no row, so the common single-bed
+	// project stays exactly as tall as it was.
+	const audioRows = useMemo(() => {
+		const voice = audioPills.filter((p) => p.kind === "voiceover");
+		const music = audioPills.filter((p) => p.kind !== "voiceover");
+		const voiceRows = packAudioTrackRows(voice);
+		const musicRows = packAudioTrackRows(music);
+		const rowOf = new Map<string, number>();
+		const base = voice.length > 0 ? voiceRows.rowCount : 0;
+		for (const pill of voice) rowOf.set(pill.id, voiceRows.rowOf.get(pill.id) ?? 0);
+		for (const pill of music) rowOf.set(pill.id, base + (musicRows.rowOf.get(pill.id) ?? 0));
+		return {
+			rowOf,
+			rowCount: Math.max(1, base + (music.length > 0 ? musicRows.rowCount : 0)),
+		};
+	}, [audioPills]);
+
+	// Whether Alt is held, so an audio pill can show that the next drag slips. Window
+	// listeners rather than per-pill handlers: the key is pressed BEFORE the pointer
+	// reaches the pill as often as after it, so a pill-local listener would miss the
+	// case the affordance exists for. `blur` clears it because a modifier held while
+	// the window loses focus never sends its keyup.
+	const [slipArmed, setSlipArmed] = useState(false);
+	useEffect(() => {
+		const sync = (e: KeyboardEvent) => setSlipArmed(e.altKey);
+		const clear = () => setSlipArmed(false);
+		window.addEventListener("keydown", sync);
+		window.addEventListener("keyup", sync);
+		window.addEventListener("blur", clear);
+		return () => {
+			window.removeEventListener("keydown", sync);
+			window.removeEventListener("keyup", sync);
+			window.removeEventListener("blur", clear);
+		};
+	}, []);
+
+	// Drag an audio track: "move" slides the head (both edges together), "l"/"r"
+	// trim the in/out points. The left edge moves the head AND the in-point so the
+	// right edge stays put — hence the single placeAudioTrack commit on release.
+	// Like the region pills, the preview is local state and the document is written
+	// once, on pointerup.
+	const startAudioDrag = useCallback(
+		(e: ReactPointerEvent, track: AxcutAudioTrack, mode: "move" | "l" | "r") => {
+			e.preventDefault();
+			e.stopPropagation();
+			tl.selectAudioTrack(track.id);
+			// Start clean: a previous drag's commit may still be in flight (its ref is
+			// cleared only when `placeAudioTrack` resolves). Without this, a plain
+			// select-click that never moves would let `up` read that stale value and
+			// re-commit the old drag — a redundant write and an extra undo step.
+			audioDragRef.current = null;
+			const el = canvasRef.current;
+			if (!el) return;
+			const r = el.getBoundingClientRect();
+			const startX = e.clientX;
+			const asset = tl.assets.find((a) => a.id === track.assetId);
+			// The source length caps the out-point; fall back to the current window when
+			// the file hasn't been probed (durationSec 0), so a drag can't extend past it.
+			const spanSec = Math.max(0, (track.endMs - track.startMs) / 1000);
+			const sourceLen = asset?.durationSec || track.durationSec || spanSec;
+			const origStart = track.startMs / 1000;
+			const origTrimStart = track.offsetMs / 1000;
+			const origTrimEnd = origTrimStart + spanSec;
+			// Alt inside the pill slips it: the span stays put and the media slides under
+			// it. On the BODY only — the edges keep their crop semantics.
+			//
+			// An edge drag sets the in-point at TIMELINE scale, which is unusable once the
+			// file is much longer than the pill: reaching 3:00 inside a four-minute bed on
+			// a five-second view means dragging three minutes of ruler. So the slip rate is
+			// derived from the FILE — one viewport width traverses all of it — floored at
+			// the timeline's own scale so a slip is never slower than moving the pill,
+			// which would be its own surprise on a file shorter than the view.
+			const slipping = mode === "move" && e.altKey && sourceLen > 0;
+			const slipSecPerPx = Math.max(total / r.width, sourceLen / Math.max(1, r.width * navSpan));
+			// A looping track may be pulled out PAST the end of its file — that is
+			// the whole point of looping, and capping at the source length is what
+			// made the loop toggle do nothing: the span could never exceed the
+			// window loop repeats, so it always played exactly once. Only the
+			// programme end bounds it (applied below).
+			const maxEnd = track.loop
+				? Number.POSITIVE_INFINITY
+				: sourceLen > 0
+					? sourceLen
+					: origTrimEnd;
+			// Snap the moving edge to clip boundaries and the timeline ends, same PILL_SNAP_PX
+			// magnet the region pills use.
+			const snapTargets = [
+				0,
+				total,
+				...clips.map((c) => c.timelineStartSec),
+				...clips.map((c) => c.timelineEndSec),
+			];
+			const snapThresh = pxPerSec > 0 ? PILL_SNAP_PX / pxPerSec : 0;
+			const snap = (v: number): number => {
+				let best = v;
+				let bestD = snapThresh;
+				for (const target of snapTargets) {
+					const d = Math.abs(target - v);
+					if (d < bestD) {
+						bestD = d;
+						best = target;
+					}
+				}
+				setSnapPct(best === v ? null : (best / total) * 100);
+				return best;
+			};
+			const move = (ev: PointerEvent) => {
+				if (slipping) {
+					const nextOffsetMs = slipAudioOffsetMs(
+						track.offsetMs,
+						track.endMs - track.startMs,
+						sourceLen,
+						(ev.clientX - startX) * slipSecPerPx * 1000,
+					);
+					if (nextOffsetMs == null) return;
+					const nextTrimStart = nextOffsetMs / 1000;
+					setAudioDragTip({
+						x: ev.clientX,
+						y: ev.clientY,
+						inSec: nextTrimStart,
+						outSec: nextTrimStart + spanSec,
+						durationSec: sourceLen,
+					});
+					// The span does not move; only the window onto the file does.
+					const slipState = {
+						id: track.id,
+						start: origStart,
+						trimStart: nextTrimStart,
+						trimEnd: nextTrimStart + spanSec,
+					};
+					audioDragRef.current = slipState;
+					setAudioDrag(slipState);
+					return;
+				}
+				const dxSec = ((ev.clientX - startX) / r.width) * total;
+				let ns = origStart;
+				let nts = origTrimStart;
+				let nte = origTrimEnd;
+				if (mode === "move") {
+					// Cap so the whole track lands by `total`: no pill past 100%, and the
+					// export (which truncates at the programme end) matches what's shown.
+					const upper = Math.max(0, total - (origTrimEnd - origTrimStart));
+					ns = Math.min(Math.max(0, snap(origStart + dxSec)), upper);
+				} else if (mode === "l") {
+					// The left edge can't cross the right one, and can't reveal more head
+					// than the source has (trimStart floors at 0 → head floors at
+					// origStart - origTrimStart).
+					const rightEdge = origStart + (origTrimEnd - origTrimStart);
+					const lowerLeft = Math.max(0, origStart - origTrimStart);
+					let newLeft = snap(origStart + dxSec);
+					newLeft = Math.min(Math.max(newLeft, lowerLeft), rightEdge - MIN_REGION_SEC);
+					ns = newLeft;
+					nts = origTrimStart + (newLeft - origStart);
+					nte = origTrimEnd;
+				} else {
+					// Right edge: move the out-point, head fixed. Snap on the timeline
+					// position of the edge, then map back to a source out-point.
+					const snappedRight = snap(origStart + (origTrimEnd - origTrimStart) + dxSec);
+					const newTrimEnd = origTrimStart + (snappedRight - origStart);
+					// Cap the out-point at the source length AND the programme end (`total`).
+					nte = Math.min(
+						Math.max(newTrimEnd, origTrimStart + MIN_REGION_SEC),
+						maxEnd,
+						origTrimStart + Math.max(0, total - origStart),
+					);
+				}
+				// The readout answers "where am I in the file", which is the one thing the
+				// pill cannot show: its edges stop at the content, but nothing said where
+				// that content was.
+				if (mode !== "move") {
+					setAudioDragTip({
+						x: ev.clientX,
+						y: ev.clientY,
+						inSec: nts,
+						outSec: nte,
+						durationSec: sourceLen,
+					});
+				}
+				const next = { id: track.id, start: ns, trimStart: nts, trimEnd: nte };
+				audioDragRef.current = next;
+				setAudioDrag(next);
+			};
+			const up = () => {
+				setSnapPct(null);
+				setAudioDragTip(null);
+				window.removeEventListener("pointermove", move);
+				window.removeEventListener("pointerup", up);
+				const fin = audioDragRef.current;
+				if (fin) {
+					void tl
+						.placeAudioTrack(fin.id, {
+							startMs: Math.round(fin.start * 1000),
+							endMs: Math.round((fin.start + Math.max(0, fin.trimEnd - fin.trimStart)) * 1000),
+							// Carries the left-edge trim: without it the head moved but the
+							// source kept playing from the same point, so dragging the edge
+							// in just slid the audio along instead of cutting its head off.
+							offsetMs: Math.round(fin.trimStart * 1000),
+						})
+						.finally(() => {
+							if (audioDragRef.current === fin) {
+								audioDragRef.current = null;
+								setAudioDrag(null);
+							}
+						});
+				} else {
+					audioDragRef.current = null;
+					setAudioDrag(null);
+				}
+			};
+			window.addEventListener("pointermove", move);
+			window.addEventListener("pointerup", up);
+		},
+		// navSpan: the slip rate is derived from the VISIBLE width, so a zoom that
+		// leaves `total` alone still changes it. Left out, the rate froze at whatever
+		// the zoom was when the callback was last built.
+		[tl, total, clips, pxPerSec, navSpan],
 	);
 
 	const startNavDrag = useCallback(
@@ -821,14 +1270,22 @@ export function V4Timeline({
 	// React marks wheel handlers passive by default, so e.preventDefault()
 	// there silently no-ops and the browser/OS still intercepts Ctrl+wheel as
 	// a page-zoom gesture.
+	// Listens on the whole panel (ref below) so the ruler, the hint labels and
+	// the nav bar all zoom/pan too — only .tlTracks scrolls natively, but the
+	// gesture shouldn't be confined to wherever that scroll happens to live.
+	// The rect stays tracksRef regardless of which descendant the wheel fired
+	// on: ruler + tracks share one horizontal padding (see the width effect
+	// below), so tracksRef reads the same left/width either way, and it's the
+	// one guaranteed to exist whenever showLanes is true.
 	useEffect(() => {
-		const el = tracksRef.current;
-		if (!el) return;
+		const panel = panelRef.current;
+		const tracks = tracksRef.current;
+		if (!panel || !tracks) return;
 		// Media shows no zoom window, so leave the wheel alone there: a zoom with
 		// no control to undo it and no ruler reading to explain it is a trap.
 		if (!showLanes) return;
 		const onWheelNative = (e: WheelEvent) => {
-			const r = el.getBoundingClientRect();
+			const r = tracks.getBoundingClientRect();
 			const viewportPct = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
 			if (e.shiftKey) {
 				e.preventDefault();
@@ -858,8 +1315,8 @@ export function V4Timeline({
 			}
 			// Otherwise let the native vertical scroll of .tlTracks run (no preventDefault).
 		};
-		el.addEventListener("wheel", onWheelNative, { passive: false });
-		return () => el.removeEventListener("wheel", onWheelNative);
+		panel.addEventListener("wheel", onWheelNative, { passive: false });
+		return () => panel.removeEventListener("wheel", onWheelNative);
 	}, [showLanes]);
 
 	// Track the tracks' content width for the ruler. .tlTracks and .tlRulerRow
@@ -1024,34 +1481,23 @@ export function V4Timeline({
 	// timeline was previously never consulted at all.
 	const runAutoZooms = useCallback(async () => {
 		setAutoEnhanceOpen(false);
-		const sources = videoSources.filter((source) => clips.some((c) => c.assetId === source.id));
-		if (sources.length === 0) {
+		const document = useProjectStore.getState().document;
+		if (!document || document.timeline.clips.length === 0) {
 			toast.error(t("toolbar.importRecordingFirst"));
 			return;
 		}
 		setAutoBusy(true);
 		try {
-			// Read once, up front: every clip reserves against the zooms the document
-			// ALREADY holds, and two clips can never contest the same stretch of ruler, so
-			// nothing here depends on the order the assets are visited — which is what lets
-			// their telemetry be fetched concurrently rather than one IPC round trip after
-			// another. `Promise.all` preserves input order, so the suggestions come out in
-			// the same sequence a loop would have produced.
-			const existingRegions = tl.zoomRegions.map((z) => ({ startMs: z.startMs, endMs: z.endMs }));
-			const perSource = await Promise.all(
-				sources.map(async (source) => {
-					const telemetry =
-						(await nativeBridgeClient.cursor.getTelemetry(fromFileUrl(source.src))) ?? [];
-					return buildAutoZoomSuggestionsForClips({
-						cursorTelemetry: telemetry,
-						assetId: source.id,
-						clips,
-						existingRegions,
-						defaultDurationMs: 2000,
-					});
-				}),
+			// Collected against the document as it is now, and again if the clips moved
+			// while the telemetry was being read: the suggestions carry timeline spans and
+			// `addZoomsBulk` anchors them against whatever the store holds at write time,
+			// so a trim or a reorder during that multi-second wait would land them on
+			// different media.
+			const collected = await collectAutoZoomSuggestionsForLatestDocument(
+				() => useProjectStore.getState().document,
+				(videoPath) => nativeBridgeClient.cursor.getTelemetry(videoPath),
 			);
-			const suggestions: AutoZoomSuggestion[] = perSource.flat();
+			const suggestions = collected?.suggestions ?? [];
 			if (suggestions.length === 0) {
 				toast.info(t("toolbar.noAutoZoomMoments"), {
 					description: t("toolbar.noAutoZoomMomentsDescription"),
@@ -1059,6 +1505,10 @@ export function V4Timeline({
 				return;
 			}
 			const added = await tl.addZoomsBulk(suggestions);
+			// A failed write returns 0 and has already toasted why. Without this the user
+			// got "Added 0 automatic zooms" stacked on top of "Failed to save project",
+			// with no zoom anywhere -- a success message for something that did not happen.
+			if (added === 0) return;
 			toast.success(
 				t(added === 1 ? "toolbar.addedAutoZoom" : "toolbar.addedAutoZoomPlural", { count: added }),
 			);
@@ -1069,7 +1519,7 @@ export function V4Timeline({
 		} finally {
 			setAutoBusy(false);
 		}
-	}, [videoSources, clips, tl, t]);
+	}, [tl, t]);
 
 	// Auto-enhance option 2 — hand a generic prompt to the AI agent (smart
 	// zooms + cuts) via the chat prompt-bus. The chat panel owns the outcome
@@ -1132,8 +1582,10 @@ export function V4Timeline({
 					compact ? ` ${styles.lanePillCompact}` : ""
 				}${seg.interactive && isPillSelected(p.id) ? ` ${styles.lanePillSel}` : ""}`}
 				style={{
-					left: `${pctOf(seg.segStart)}%`,
-					width: `${pctOf(durSec)}%`,
+					left: `${pctAt(seg.segStart)}%`,
+					// Measured on the expanded ruler at BOTH ends: a region straddling a pause
+					// covers it, so its box has to grow by that pause and not merely slide.
+					width: `${pctOf(seg.segEnd - seg.segStart)}%`,
 					transform: seg.shiftPx ? `translateX(${seg.shiftPx}px)` : undefined,
 					transition: !clipDrag
 						? undefined
@@ -1148,6 +1600,24 @@ export function V4Timeline({
 						: {}),
 				}}
 				onPointerDown={seg.interactive ? (e) => startPillDrag(e, p, "move") : undefined}
+				// A pill is focusable and announced as a button, so Enter and Space have to
+				// activate it — without this a keyboard user could tab to a region and then
+				// reach nothing that acts on a selection: Delete, copy/paste, the inspector.
+				//
+				// `nativeEvent.stopPropagation()`, not just the synthetic one: the editor
+				// shell listens on WINDOW, above React's root container, and Space is bound
+				// to play/pause there. Stopping only the synthetic event would select the
+				// pill and toggle playback in the same keystroke.
+				onKeyDown={
+					seg.interactive
+						? (e) => {
+								if (e.key !== "Enter" && e.key !== " ") return;
+								e.preventDefault();
+								e.nativeEvent.stopPropagation();
+								selectPill(p, e.shiftKey);
+							}
+						: undefined
+				}
 				title={p.label}
 			>
 				{seg.interactive ? (
@@ -1258,184 +1728,214 @@ export function V4Timeline({
 	};
 
 	return (
-		<div className={styles.tl}>
+		<div className={styles.tl} ref={panelRef}>
 			<div className={styles.tlToolbar}>
 				{showLanes ? (
-					<div className={styles.tlTools} role="toolbar" aria-label={t("toolbar.timelineTools")}>
-						<Popover open={autoEnhanceOpen} onOpenChange={setAutoEnhanceOpen}>
-							<PopoverTrigger asChild>
+					// Its own provider rather than leaning on the app root's: the toolbar
+					// is the only thing here that needs one, and every test that renders
+					// a timeline (directly or through the shell) would otherwise have to
+					// know to supply it. Nesting under the root provider is harmless.
+					<TooltipProvider>
+						<div className={styles.tlTools} role="toolbar" aria-label={t("toolbar.timelineTools")}>
+							<Popover open={autoEnhanceOpen} onOpenChange={setAutoEnhanceOpen}>
+								<Tooltip content={t("toolbar.autoEnhance")}>
+									<PopoverTrigger asChild>
+										<button
+											type="button"
+											className={styles.tlToolBtn}
+											aria-label={t("toolbar.autoEnhance")}
+											disabled={autoBusy}
+										>
+											{autoBusy ? (
+												<Loader2 className="animate-spin" size={15} />
+											) : (
+												<Wand2 size={15} />
+											)}
+										</button>
+									</PopoverTrigger>
+								</Tooltip>
+								<PopoverContent
+									align="start"
+									sideOffset={6}
+									animated={false}
+									className="w-auto border-0 bg-transparent p-0 shadow-none"
+								>
+									<div
+										className={styles.recMenu}
+										style={{ position: "relative", bottom: "auto", width: 244 }}
+									>
+										<button
+											type="button"
+											className={styles.recMenuRow}
+											onClick={() => void runAutoZooms()}
+										>
+											<ZoomIn size={15} style={{ flexShrink: 0 }} />
+											<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+												<span style={{ fontWeight: 600 }}>{t("toolbar.automaticZooms")}</span>
+												<span style={{ fontSize: 11, color: "var(--muted)" }}>
+													{t("toolbar.automaticZoomsHint")}
+												</span>
+											</span>
+										</button>
+										<button
+											type="button"
+											className={styles.recMenuRow}
+											onClick={runAiEnhance}
+											disabled={smartCutsBlocked}
+											title={
+												transcriptGate.reason === "failed" ? transcriptGate.message : undefined
+											}
+											style={
+												smartCutsBlocked ? { opacity: 0.55, cursor: "not-allowed" } : undefined
+											}
+										>
+											{transcriptGate.state === "pending" ? (
+												<Loader2 size={15} className="animate-spin" style={{ flexShrink: 0 }} />
+											) : (
+												<Sparkles size={15} style={{ flexShrink: 0 }} />
+											)}
+											<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+												<span style={{ fontWeight: 600 }}>{t("toolbar.smartZoomsAndCuts")}</span>
+												<span style={{ fontSize: 11, color: "var(--muted)" }}>{smartCutsHint}</span>
+											</span>
+										</button>
+									</div>
+								</PopoverContent>
+							</Popover>
+							<span className={styles.tlToolSep} aria-hidden />
+							{tools.map((tool) => (
+								<Fragment key={tool.id}>
+									<Tooltip content={tool.label}>
+										<button
+											type="button"
+											className={styles.tlToolBtn}
+											aria-label={tool.label}
+											onClick={() => {
+												// Read at CLICK time: a render-time value would be one zoom
+												// notch stale when the user zooms and immediately creates.
+												const dur = newRegionDurationSec();
+												if (tool.id === "speed") void tl.addSpeed(dur);
+												if (tool.id === "comment") void tl.addAnnotation(dur);
+												if (tool.id === "cut") void tl.addTrim(dur);
+											}}
+										>
+											{tool.icon}
+										</button>
+									</Tooltip>
+									{/* Add audio sits right after Add annotation (issue #350). */}
+									{/* One audio button, two ways in. A mic and a music note side by
+								    side both just said "audio" and left the user to guess which
+								    was which; a waveform is neutral between them, and the menu
+								    names the two paths outright. Mirrors the auto-enhance
+								    button's menu right next to it. */}
+									{tool.id === "comment" ? (
+										<Popover open={audioMenuOpen} onOpenChange={setAudioMenuOpen}>
+											<Tooltip content={t("toolbar.addAudioTooltip")}>
+												<PopoverTrigger asChild>
+													<button
+														type="button"
+														className={styles.tlToolBtn}
+														aria-label={t("toolbar.addAudioTooltip")}
+													>
+														<AudioLines size={15} />
+													</button>
+												</PopoverTrigger>
+											</Tooltip>
+											<PopoverContent
+												align="start"
+												sideOffset={6}
+												animated={false}
+												className="w-auto border-0 bg-transparent p-0 shadow-none"
+											>
+												<div
+													className={styles.recMenu}
+													style={{ position: "relative", bottom: "auto", width: 244 }}
+												>
+													<button
+														type="button"
+														className={styles.recMenuRow}
+														onClick={() => {
+															setAudioMenuOpen(false);
+															onAddVoiceover();
+														}}
+													>
+														<Mic size={15} style={{ flexShrink: 0 }} />
+														<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+															<span style={{ fontWeight: 600 }}>{t("audio.addVoiceover")}</span>
+															<span style={{ fontSize: 11, color: "var(--muted)" }}>
+																{t("audio.addVoiceoverHint")}
+															</span>
+														</span>
+														<kbd className={styles.recMenuKey}>
+															{formatBinding(shortcuts.addVoiceover, isMac)}
+														</kbd>
+													</button>
+													<button
+														type="button"
+														className={styles.recMenuRow}
+														onClick={() => {
+															setAudioMenuOpen(false);
+															void tl.addAudio();
+														}}
+													>
+														<Music size={15} style={{ flexShrink: 0 }} />
+														<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+															<span style={{ fontWeight: 600 }}>{ts("audioTrack.add")}</span>
+															<span style={{ fontSize: 11, color: "var(--muted)" }}>
+																{t("audio.importFileHint")}
+															</span>
+														</span>
+														<kbd className={styles.recMenuKey}>
+															{formatBinding(shortcuts.addAudio, isMac)}
+														</kbd>
+													</button>
+												</div>
+											</PopoverContent>
+										</Popover>
+									) : null}
+								</Fragment>
+							))}
+							<Tooltip content={t("buttons.addZoom")}>
 								<button
 									type="button"
 									className={styles.tlToolBtn}
-									title={t("toolbar.autoEnhance")}
-									aria-label={t("toolbar.autoEnhance")}
-									disabled={autoBusy}
+									aria-label={t("buttons.addZoom")}
+									onClick={() => void tl.addZoom(newRegionDurationSec())}
 								>
-									{autoBusy ? <Loader2 className="animate-spin" size={15} /> : <Wand2 size={15} />}
+									<ZoomIn size={15} />
 								</button>
-							</PopoverTrigger>
-							<PopoverContent
-								align="start"
-								sideOffset={6}
-								animated={false}
-								className="w-auto border-0 bg-transparent p-0 shadow-none"
+							</Tooltip>
+							<Tooltip
+								content={t(
+									settings.autoFocusAll ? "buttons.autoFocusAllOn" : "buttons.autoFocusAllOff",
+								)}
 							>
-								<div
-									className={styles.recMenu}
-									style={{ position: "relative", bottom: "auto", width: 244 }}
-								>
-									<button
-										type="button"
-										className={styles.recMenuRow}
-										onClick={() => void runAutoZooms()}
-									>
-										<ZoomIn size={15} style={{ flexShrink: 0 }} />
-										<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-											<span style={{ fontWeight: 600 }}>{t("toolbar.automaticZooms")}</span>
-											<span style={{ fontSize: 11, color: "var(--muted)" }}>
-												{t("toolbar.automaticZoomsHint")}
-											</span>
-										</span>
-									</button>
-									<button
-										type="button"
-										className={styles.recMenuRow}
-										onClick={runAiEnhance}
-										disabled={smartCutsBlocked}
-										title={transcriptGate.reason === "failed" ? transcriptGate.message : undefined}
-										style={smartCutsBlocked ? { opacity: 0.55, cursor: "not-allowed" } : undefined}
-									>
-										{transcriptGate.state === "pending" ? (
-											<Loader2 size={15} className="animate-spin" style={{ flexShrink: 0 }} />
-										) : (
-											<Sparkles size={15} style={{ flexShrink: 0 }} />
-										)}
-										<span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-											<span style={{ fontWeight: 600 }}>{t("toolbar.smartZoomsAndCuts")}</span>
-											<span style={{ fontSize: 11, color: "var(--muted)" }}>{smartCutsHint}</span>
-										</span>
-									</button>
-								</div>
-							</PopoverContent>
-						</Popover>
-						<span className={styles.tlToolSep} aria-hidden />
-						{tools.map((tool) => (
-							<button
-								type="button"
-								key={tool.id}
-								className={styles.tlToolBtn}
-								title={tool.label}
-								aria-label={tool.label}
-								onClick={() => {
-									// Read at CLICK time: a render-time value would be one zoom
-									// notch stale when the user zooms and immediately creates.
-									const dur = newRegionDurationSec();
-									if (tool.id === "speed") void tl.addSpeed(dur);
-									if (tool.id === "comment") void tl.addAnnotation(dur);
-									if (tool.id === "cut") void tl.addTrim(dur);
-								}}
-							>
-								{tool.icon}
-							</button>
-						))}
-						<button
-							type="button"
-							className={styles.tlToolBtn}
-							title={t("buttons.addZoom")}
-							aria-label={t("buttons.addZoom")}
-							onClick={() => void tl.addZoom(newRegionDurationSec())}
-						>
-							<ZoomIn size={15} />
-						</button>
-						<button
-							type="button"
-							className={styles.tlToolBtn}
-							aria-pressed={settings.autoFocusAll}
-							title={t(
-								settings.autoFocusAll ? "buttons.autoFocusAllOn" : "buttons.autoFocusAllOff",
-							)}
-							aria-label={t(
-								settings.autoFocusAll ? "buttons.autoFocusAllOn" : "buttons.autoFocusAllOff",
-							)}
-							onClick={() => void setSettings({ autoFocusAll: !settings.autoFocusAll })}
-						>
-							<Crosshair size={15} />
-						</button>
-						<button
-							type="button"
-							className={styles.tlToolBtn}
-							title={t("buttons.addCameraFullscreen")}
-							aria-label={t("buttons.addCameraFullscreen")}
-							onClick={() => void tl.addCameraFullscreen(newRegionDurationSec())}
-						>
-							<Maximize2 size={15} />
-						</button>
-						<span className={styles.tlToolSep} aria-hidden />
-						<Popover open={aspectMenuOpen} onOpenChange={setAspectMenuOpen}>
-							<PopoverTrigger asChild>
 								<button
 									type="button"
-									className={styles.tlAspect}
-									title={t("toolbar.aspectRatio")}
-									aria-label={t("toolbar.aspectRatio")}
+									className={styles.tlToolBtn}
+									aria-pressed={settings.autoFocusAll}
+									aria-label={t(
+										settings.autoFocusAll ? "buttons.autoFocusAllOn" : "buttons.autoFocusAllOff",
+									)}
+									onClick={() => void setSettings({ autoFocusAll: !settings.autoFocusAll })}
 								>
-									{getAspectRatioLabel(settings.aspectRatio)}
-									<ChevronDown size={10} />
+									<Crosshair size={15} />
 								</button>
-							</PopoverTrigger>
-							<PopoverContent
-								align="end"
-								sideOffset={6}
-								animated={false}
-								className="w-auto border-0 bg-transparent p-0 shadow-none"
-							>
-								<div
-									className={styles.recMenu}
-									style={{ position: "relative", bottom: "auto", width: 210 }}
+							</Tooltip>
+							<Tooltip content={t("buttons.addCameraFullscreen")}>
+								<button
+									type="button"
+									className={styles.tlToolBtn}
+									aria-label={t("buttons.addCameraFullscreen")}
+									disabled={!hasAnyCamera}
+									style={!hasAnyCamera ? { opacity: 0.55, cursor: "not-allowed" } : undefined}
+									onClick={() => void tl.addCameraFullscreen(newRegionDurationSec())}
 								>
-									{ASPECT_RATIO_PRESETS.map((ratio) => (
-										<button
-											type="button"
-											key={ratio}
-											className={`${styles.recMenuRow}${
-												ratio === settings.aspectRatio ? ` ${styles.active}` : ""
-											}`}
-											onClick={() => {
-												void setSettings({ aspectRatio: ratio });
-												setAspectMenuOpen(false);
-											}}
-										>
-											{ratio}
-										</button>
-									))}
-									{nativeFormats.length > 0 ? (
-										<>
-											<div style={aspectSectionLabelStyle}>{t("toolbar.original")}</div>
-											{nativeFormats.map((format) => (
-												<button
-													type="button"
-													key={format.token}
-													className={`${styles.recMenuRow}${
-														format.token === settings.aspectRatio ? ` ${styles.active}` : ""
-													}`}
-													onClick={() => {
-														void setSettings({ aspectRatio: format.token });
-														setAspectMenuOpen(false);
-													}}
-												>
-													{format.token}
-													<span style={nativeBadgeStyle}>
-														{`${format.width}×${format.height}`}
-														{timelineIsMixed ? ` · ${format.clipCount}` : ""}
-													</span>
-												</button>
-											))}
-										</>
-									) : null}
-								</div>
-							</PopoverContent>
-						</Popover>
-					</div>
+									<Maximize2 size={15} />
+								</button>
+							</Tooltip>
+						</div>
+					</TooltipProvider>
 				) : (
 					// Media is an ARRANGING surface: add, remove, reorder. Nothing here
 					// plays or edits, so the transport, the scroll hints, the zoom nav and
@@ -1496,7 +1996,7 @@ export function V4Timeline({
 								<div
 									key={tick.sec}
 									className={`${styles.tlTick}${tick.major ? ` ${styles.tlTickMajor}` : ""}`}
-									style={{ left: `${pctOf(tick.sec)}%` }}
+									style={{ left: `${pctAt(tick.sec)}%` }}
 								>
 									{tick.major ? (
 										<span className={styles.tlTickLabel}>{fmtTick(tick.sec, rulerTicks.step)}</span>
@@ -1527,7 +2027,100 @@ export function V4Timeline({
 								<div className={styles.tlLane}>{renderPills(trimPills, t("hints.pressTrim"))}</div>
 								<div className={styles.tlLane}>{renderPills(zoomPills, t("hints.pressZoom"))}</div>
 								<div className={styles.tlLane}>
-									{renderPills(cameraFullscreenPills, t("hints.pressCameraFullscreen"))}
+									{/* Advertising "Press C" on a project with no webcam invites a keystroke
+									    that `addCameraFullscreen` now refuses (#353). The toolbar button is
+									    already disabled; this keeps the lane from contradicting it. */}
+									{renderPills(
+										cameraFullscreenPills,
+										hasAnyCamera ? t("hints.pressCameraFullscreen") : ts("layout.noWebcam"),
+									)}
+								</div>
+								{/* Imported audio tracks (issue #350). Always shown, like every other
+								    lane — "Add audio" is a toolbar peer of the region tools now (and
+								    has a keyboard shortcut), so an empty lane advertises the shortcut
+								    that fills it rather than hiding until the first import. */}
+								<div
+									className={`${styles.tlLane} ${styles.tlLaneAudio}`}
+									// Grows a row per overlapping track, so three voiceovers over
+									// the same stretch are three legible pills rather than one
+									// pile nobody can aim at.
+									style={{
+										height:
+											audioRows.rowCount * AUDIO_ROW_HEIGHT_PX +
+											(audioRows.rowCount - 1) * AUDIO_ROW_GAP_PX +
+											AUDIO_LANE_PAD_PX * 2,
+									}}
+								>
+									{tl.audioTracks.length === 0 ? (
+										<span
+											className={styles.laneEmpty}
+											style={{ left: `${nav.start * 100}%`, width: `${navSpan * 100}%` }}
+										>
+											{t("hints.pressAudio")}
+										</span>
+									) : (
+										// One pill per user-visible track: the document stores one
+										// clip-anchored fragment per clip the track covers, and the
+										// lane must not show a split take as two pills.
+										audioPills.map((track) => {
+											const asset = tl.assets.find((a) => a.id === track.assetId);
+											const duration = asset?.durationSec ?? track.durationSec;
+											// While this track is being dragged, lay it out from the live
+											// preview geometry instead of the not-yet-written document.
+											const drag = audioDrag?.id === track.id ? audioDrag : null;
+											const start = drag ? drag.start : track.startMs / 1000;
+											// A drag carries its span as the trim window it is dragging
+											// the edges of; the pill's width is that window.
+											const widthSec = drag
+												? Math.max(0, drag.trimEnd - drag.trimStart)
+												: Math.max(0, (track.endMs - track.startMs) / 1000);
+											const trimStart = drag ? drag.trimStart : track.offsetMs / 1000;
+											const trimEnd = trimStart + widthSec;
+											return (
+												<AudioLanePill
+													key={track.id}
+													track={track}
+													url={asset ? toFileUrl(asset.originalPath) : undefined}
+													assetDurationSec={duration}
+													leftPct={pctOf(start)}
+													widthPct={pctOf(widthSec)}
+													row={audioRows.rowOf.get(track.id) ?? 0}
+													rowHeight={AUDIO_ROW_HEIGHT_PX + AUDIO_ROW_GAP_PX}
+													spanSec={widthSec}
+													loopWindowSec={Math.max(0, (duration || 0) - trimStart)}
+													sourceStartSec={trimStart}
+													// A looping pill can outrun its file; the waveform draws
+													// the source it actually has.
+													sourceEndSec={duration > 0 ? Math.min(trimEnd, duration) : trimEnd}
+													selected={tl.selectedAudioTrackId === track.id}
+													onStartDrag={startAudioDrag}
+													onSelect={tl.selectAudioTrack}
+													label={track.label || asset?.label || ts("audioTrack.defaultLabel")}
+													slipHint={ts("audioTrack.slipHint")}
+													slipArmed={slipArmed}
+													outputGain={audioGainScalar(settings.audioGainDb)}
+													ghost={((g) =>
+														g
+															? {
+																	leftPct: pctOf(g.startT),
+																	widthPct: pctOf(g.endT - g.startT),
+																	sourceStartSec: g.sourceStartSec,
+																	sourceEndSec: g.sourceEndSec,
+																}
+															: null)(
+														audioGhostExtent(
+															trimStart,
+															widthSec,
+															duration,
+															start,
+															start + widthSec,
+															total,
+														),
+													)}
+												/>
+											);
+										})
+									)}
 								</div>
 							</>
 						) : null}
@@ -1545,11 +2138,17 @@ export function V4Timeline({
 								e.preventDefault();
 								setDragOver(false);
 								const id = e.dataTransfer.getData(ASSET_MIME);
-								if (id && onDropAsset) onDropAsset(id);
+								if (id && onDropAsset) void onDropAsset(id).catch(() => undefined);
 							}}
 						>
 							{clips.map((c, i) => {
 								const dur = c.timelineEndSec - c.timelineStartSec;
+								// On the expanded ruler the box also carries whatever pauses fall
+								// inside it — the film really does stay on this clip's frame for
+								// them, so they belong to its box rather than between boxes.
+								const boxStart = c.timelineStartSec;
+								const boxEnd = c.timelineEndSec;
+								const boxLen = boxEnd - boxStart;
 								const asset = tl.assets.find((a) => a.id === c.assetId);
 								const clipVideoUrl = videoSources.find((v) => v.id === c.assetId)?.src;
 								const selected = tl.clipSelection === c.id;
@@ -1569,20 +2168,29 @@ export function V4Timeline({
 									else if (target < from && i >= target && i < from)
 										clipTransform = `translateX(${shiftPx}px)`;
 								}
+								// Too narrow to hold its own controls. An insertion of a few tenths
+								// of a second on a half-minute timeline is a handful of pixels, and
+								// there is no arrangement that fits a button inside that — so while
+								// it is selected the controls step outside the box instead.
+								const narrow = boxLen * pxPerSec < NARROW_CLIP_PX;
 								return (
 									<div
 										key={c.id}
 										data-clip-id={c.id}
-										className={`${styles.tlClip}${selected ? ` ${styles.tlClipSel}` : ""}${
+										className={`${styles.tlClip}${narrow ? ` ${styles.tlClipNarrow}` : ""}${
+											// Amber, because nobody shot it. Same token the mark it replaces
+											// used, so an insertion still reads as one at a glance.
+											isGeneratedAssetId(c.assetId) ? ` ${styles.tlClipGenerated}` : ""
+										}${selected ? ` ${styles.tlClipSel}` : ""}${
 											dragging ? ` ${styles.tlClipDragging}` : ""
 										}`}
 										style={{
-											left: `${pctOf(c.timelineStartSec)}%`,
+											left: `${pctOf(boxStart)}%`,
 											// Minus the gutter that separates two cards (it used to be the
 											// flex row's `gap`). A clip shorter than the gutter lands on
 											// .tlClip's 1px min-width instead of collapsing — same rule as
 											// the lane pills above.
-											width: `calc(${pctOf(dur)}% - ${CLIP_GUTTER_PX}px)`,
+											width: `calc(${pctOf(boxLen)}% - ${CLIP_GUTTER_PX}px)`,
 											transform: clipTransform,
 										}}
 										onPointerDown={(e) => startClipDrag(e, c)}
@@ -1607,6 +2215,7 @@ export function V4Timeline({
 											assetDurationSec={asset?.durationSec}
 											sourceStartSec={c.sourceStartSec}
 											sourceEndSec={c.sourceEndSec ?? c.sourceStartSec + dur}
+											gain={audioGainScalar(settings.audioGainDb)}
 										/>
 										<div className={styles.tlClipLabel}>
 											<span
@@ -1629,6 +2238,7 @@ export function V4Timeline({
 												type="button"
 												data-no-clip-drag
 												className={styles.tlClipDelete}
+												data-narrow={narrow ? "true" : undefined}
 												title={t("toolbar.deleteClip")}
 												aria-label={t("toolbar.deleteClip")}
 												onClick={(e) => {
@@ -1694,6 +2304,16 @@ export function V4Timeline({
 					>
 						<span />
 					</div>
+				</div>
+			) : null}
+			{/* The crop readout, at the component ROOT rather than in the lane: the lane
+			    sits inside the zoomed canvas transform, which would scale a chip placed
+			    there. `in -> out / length` — 0:00.0 and out = length are the boundary
+			    states, self-evident without copy, which is why this adds no locale key. */}
+			{audioDragTip ? (
+				<div className={styles.tlDragTip} style={{ left: audioDragTip.x, top: audioDragTip.y }}>
+					{formatSec(audioDragTip.inSec)} → {formatSec(audioDragTip.outSec)}
+					{audioDragTip.durationSec > 0 ? ` / ${formatSec(audioDragTip.durationSec)}` : ""}
 				</div>
 			) : null}
 		</div>

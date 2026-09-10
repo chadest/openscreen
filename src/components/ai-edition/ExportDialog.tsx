@@ -8,7 +8,7 @@
 // used by the legacy VideoEditor; this one is a compact surface tuned for
 // the new shell's modal style.
 
-import { Download, FileVideo, Loader2 } from "lucide-react";
+import { Download, FileVideo, FolderOpen, Loader2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useScopedT } from "@/contexts/I18nContext";
@@ -20,6 +20,7 @@ import {
 } from "@/lib/ai-edition/document/outputFormat";
 import type { AxcutDocument } from "@/lib/ai-edition/schema";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
+import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
 import { resolveClipSourceEndSec } from "@/lib/ai-edition/timeline/clipDuration";
 import {
 	type ExportFormat,
@@ -32,6 +33,7 @@ import {
 	type GifSizePreset,
 } from "@/lib/exporter";
 import { calculateMp4ExportSettings, wouldUpscale } from "@/lib/exporter/mp4ExportSettings";
+import { outputFrameCount } from "@/lib/exporter/outputFrameCount";
 import { exportGifNative, exportMultiNative, useIsCpuCompositor } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
 import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
@@ -50,6 +52,29 @@ function formatHms(totalSeconds: number): string {
 	return [h, m, sec].map((v) => v.toString().padStart(2, "0")).join(":");
 }
 
+/** Opens the exported file's containing folder, selecting the file itself where the OS supports
+ *  it. The main handler owns the fallback (`shell.openPath` on the parent directory) for the
+ *  cases `showItemInFolder` rejects — a file moved or deleted since the export, or a platform
+ *  that cannot reveal — so nothing here has to pre-check that the file still exists.
+ *
+ *  Shared by the success toast's action and the done panel's button so the two can't drift.
+ *  `revealInFolder` is a bare ipcRenderer.invoke, so it rejects when the main handler throws,
+ *  and resolves `{ success: false }` when even the fallback failed. The export already
+ *  succeeded — failing to open the folder is not worth a second error toast, but it is worth
+ *  a line. */
+function revealExportedFile(filePath: string): void {
+	void window.electronAPI
+		?.revealInFolder?.(filePath)
+		.then((result) => {
+			if (!result?.success) {
+				console.warn("[export] could not open the exported file's folder:", result?.error);
+			}
+		})
+		.catch((err) => {
+			console.warn("[export] failed to reveal the file in its folder:", err);
+		});
+}
+
 /** Maps the document's timeline to the native multiclip export contract: ordered,
  *  trim-narrowed clips (`resolveVisibleClips` — shared with `buildSceneDescription` and
  *  `NativeCompositorOverlay`, so export/preview/scene all see the exact same clip stream),
@@ -62,24 +87,21 @@ function buildNativeClipList(document: AxcutDocument): CompositorClipInput[] {
 		if (!asset?.originalPath) {
 			return [];
 		}
-		const cam = asset.cameraTrack;
+		const camera = assetCameraSource(asset);
 		// sourceEndSec is optional in the schema (unknown until probed) — fall back through
 		// the single canonical precedence used by every consumer (clip.probe → asset.duration
 		// → timeline-length guess). See `resolveClipSourceEndSec` for the full order.
 		const sourceEndSec = resolveClipSourceEndSec(clip, asset);
-		// ponytail: matches the rule in `buildSceneDescription` — screen recordings
-		// from this app always carry a decodable audio track (the webcam path
-		// never does), so the only clips that reach this branch already have audio.
-		// If a per-asset audio-probe flag lands on the schema later, swap to
-		// `Boolean(asset.audio)` here too and keep these two derivation paths in
-		// lock-step with `buildSceneDescription` in src/native/sceneDescription.ts.
+		// ponytail: `hasAudio` stays optimistic for the same reason as in
+		// `buildSceneDescription` — nothing populates `asset.audio` yet, and the
+		// native side degrades cleanly on a stream-less file.
 		return [
 			{
 				screenPath: asset.originalPath,
-				webcamPath: cam?.sourcePath ?? asset.originalPath,
+				webcamPath: camera.path,
 				sourceStartSec: clip.sourceStartSec,
 				sourceEndSec,
-				webcamOffsetSec: cam ? (cam.startMs + cam.offsetMs) / 1000 : 0,
+				webcamOffsetSec: camera.offsetSec,
 				hasAudio: true,
 			},
 		];
@@ -266,15 +288,17 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			const clips = buildNativeClipList(document);
 			// GIF runs at its own frame rate, so the progress total has to use it.
 			const outFps = format === "gif" ? gifFrameRate : fps;
-			// Total frames the encoder will produce, known upfront from the timeline (sum of
-			// each clip's trimmed source duration) — the native side only reports frames
-			// AFTER encoding one (onNativeExportProgress), it doesn't know/send a total, so
-			// this is computed here to turn that raw count into a percentage.
-			const totalDurationSec = clips.reduce(
-				(sum, c) => sum + Math.max(0, c.sourceEndSec - c.sourceStartSec),
-				0,
-			);
-			const totalFrames = Math.max(1, Math.round(totalDurationSec * outFps));
+			// Total frames the encoder will produce, known upfront from the timeline — the
+			// native side only reports frames AFTER composing one (onNativeExportProgress),
+			// it doesn't know or send a total, so this is computed here to turn that raw
+			// count into a percentage.
+			//
+			// It has to count SPEED-ADJUSTED frames, not source seconds: a clip under a 1.25x
+			// region emits 80% of `duration * fps`, which is where the "frozen at ~80%" of
+			// OpenScreen#371 came from — the bar climbed to 80% and the export finished
+			// there. `outputFrameCount` mirrors the compositor's own span arithmetic.
+			const sceneDesc = buildSceneDescription(document);
+			const totalFrames = outputFrameCount(clips, sceneDesc.speedRegions, outFps);
 			const startedAt = Date.now();
 			const unsubscribeProgress = window.electronAPI?.onNativeExportProgress?.((frames) => {
 				const elapsedS = (Date.now() - startedAt) / 1000;
@@ -288,14 +312,18 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				});
 			});
 			try {
-				const sceneJson = JSON.stringify(buildSceneDescription(document));
+				// The webcam background effect is applied by the compositor from the scene,
+				// so the clip list needs no pre-rendering pass.
+				const exportClips = clips;
+
+				const sceneJson = JSON.stringify(sceneDesc);
 				const outDims = tierOutputDims(quality);
-				if (clips.length === 0) {
+				if (exportClips.length === 0) {
 					throw new Error(t("exportDialog.nothingToExport"));
 				}
 				const stats =
 					format === "gif"
-						? await exportGifNative(clips, pickedPath, sceneJson, {
+						? await exportGifNative(exportClips, pickedPath, sceneJson, {
 								// GIF is 256-colour and grows fast; cap the long edge at the
 								// chosen preset rather than exporting at source size.
 								...gifOutputDims(gifSize, outDims),
@@ -303,7 +331,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 								// 0 = infinite, the historical GIF default; 1 = play once.
 								loopCount: gifLoop ? 0 : 1,
 							})
-						: await exportMultiNative(clips, pickedPath, sceneJson, {
+						: await exportMultiNative(exportClips, pickedPath, sceneJson, {
 								width: outDims?.width,
 								height: outDims?.height,
 								fps,
@@ -315,14 +343,9 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 					description: `${pickedPath} · ${formatHms(stats.videoDurationS)} ${t("exportDialog.exportedVideoOf")} ${formatHms(stats.wallS)}`,
 					action: {
 						label: t("exportDialog.showInFolder"),
-						onClick: () => {
-							// `revealInFolder` is a bare ipcRenderer.invoke, so it rejects when
-							// the main handler throws. The export already succeeded — failing to
-							// open the folder is not worth a second toast, but it is worth a line.
-							void window.electronAPI?.revealInFolder?.(pickedPath).catch((err) => {
-								console.warn("[export] failed to reveal the file in its folder:", err);
-							});
-						},
+						// The toast is gone in five seconds; the done panel below keeps the same
+						// action around for as long as the dialog is open.
+						onClick: () => revealExportedFile(pickedPath),
 					},
 				});
 			} catch (err) {
@@ -572,7 +595,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 							</div>
 						</div>
 						<div className={styles.paneRow} style={{ margin: 0 }}>
-							<span className="label">{t("exportDialog.loopGif")}</span>
+							<span className={styles.label}>{t("exportDialog.loopGif")}</span>
 							<button
 								type="button"
 								className={`${styles.toggle} ${gifLoop ? styles.isOn : ""}`}
@@ -748,10 +771,27 @@ function ProgressBlock({
 					background: "var(--success-soft)",
 					color: "var(--fg-2)",
 					font: "500 12px var(--font-body)",
+					display: "flex",
+					flexDirection: "column",
+					alignItems: "flex-start",
+					gap: 12,
 				}}
 			>
-				{t("exportDialog.savedTo")}{" "}
-				<span style={{ fontFamily: "var(--font-mono)" }}>{savedPath}</span>
+				<div>
+					{t("exportDialog.savedTo")}{" "}
+					<span style={{ fontFamily: "var(--font-mono)" }}>{savedPath}</span>
+				</div>
+				{savedPath ? (
+					<button
+						type="button"
+						data-testid="export-show-in-folder"
+						className={`${styles.btn} ${styles.btnSecondary}`}
+						onClick={() => revealExportedFile(savedPath)}
+					>
+						<FolderOpen size={14} />
+						{t("exportDialog.showInFolder")}
+					</button>
+				) : null}
 			</div>
 		);
 	}

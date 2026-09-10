@@ -2,6 +2,17 @@
   description = "OpenScreen — desktop screen recorder with built-in editor";
 
   inputs = {
+    # Do not roll flake.lock BACK past nixpkgs d2f6794 (2026-08-29). Before it,
+    # `importCargoLock` fetched every crate from
+    # `https://crates.io/api/v1/crates/<name>/<version>/download`, which crates.io
+    # now answers with 403 — it rate-limits that endpoint to 1 req/s and points
+    # clients at the CDN instead (rust-lang/crates.io#13482). Every crate in the
+    # lockfile failed, so `nix build` died in `cargo-vendor-dir` before reaching a
+    # single derivation of ours: `Nix build` was red on main from 2026-08-30, and
+    # since `nix-check.yml` only compares npmDepsHash and `nix-build.yml` did not
+    # run on pull requests, the derivation itself was not being built anywhere --
+    # not before a merge, and not after one either while this was red.
+    # d2f6794 carries the switch to `https://static.crates.io/crates`.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
@@ -17,10 +28,27 @@
     {
       # -- Per-system outputs (packages, dev shells) --
 
-      packages = forAllSystems (pkgs: {
-        openscreen = pkgs.callPackage ./nix/package.nix { };
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.openscreen;
-      });
+      packages = forAllSystems (
+        pkgs:
+        let
+          # Bound once and reused. compositor-view used to be applied twice --
+          # once for the exposed attribute, once inline as package.nix's argument
+          # -- which produces the same store path today but means an override
+          # applied to the attribute never reaches the app. With a second native
+          # component the same mistake would have been made twice.
+          ffmpeg-lgpl = pkgs.callPackage ./nix/ffmpeg-lgpl.nix { };
+          compositor-view = pkgs.callPackage ./nix/compositor-view.nix { inherit ffmpeg-lgpl; };
+          pipewire-helper = pkgs.callPackage ./nix/pipewire-helper.nix { inherit ffmpeg-lgpl; };
+          whisper-stt = pkgs.callPackage ./nix/whisper-stt.nix { };
+        in
+        {
+          inherit compositor-view pipewire-helper whisper-stt;
+          openscreen = pkgs.callPackage ./nix/package.nix {
+            inherit compositor-view pipewire-helper whisper-stt;
+          };
+          default = self.packages.${pkgs.stdenv.hostPlatform.system}.openscreen;
+        }
+      );
 
       devShells = forAllSystems (
         pkgs:

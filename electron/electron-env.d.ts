@@ -81,7 +81,10 @@ interface Window {
 		requestNativeMacCursorAccess: () => Promise<{
 			success: boolean;
 			granted: boolean;
-			status: string;
+			// "not-determined" is the only genuine denial; the rest mean the helper
+			// never got to ask. See macNativeCursorRecordingSession.ts.
+			status: "granted" | "not-determined" | "missing-helper" | "error" | "exited" | "timeout";
+			accessibilityTrusted: boolean;
 			error?: string;
 		}>;
 		assetBaseUrl: string;
@@ -145,6 +148,11 @@ interface Window {
 			message?: string;
 			discarded?: boolean;
 			error?: string;
+			/**
+			 * A camera was recorded but produced nothing usable, so the session was
+			 * saved without it. Still a success — the screen video is intact.
+			 */
+			webcamDropped?: boolean;
 		}>;
 		pauseNativeWindowsRecording: () => Promise<{
 			success: boolean;
@@ -281,6 +289,22 @@ interface Window {
 			name?: string;
 			canceled?: boolean;
 		}>;
+		// Import an external audio file from the timeline toolbar (issue #350).
+		openAudioFilePicker: () => Promise<{
+			success: boolean;
+			path?: string;
+			name?: string;
+			canceled?: boolean;
+			message?: string;
+		}>;
+		// Persist an in-editor voiceover take (raw MediaRecorder bytes) under the
+		// recordings dir, so it outlives the session like every other asset.
+		saveRecordedVoiceover: (data: ArrayBuffer) => Promise<{
+			success: boolean;
+			path?: string;
+			message?: string;
+			error?: string;
+		}>;
 		setCurrentVideoPath: (path: string) => Promise<{ success: boolean }>;
 		setCurrentRecordingSession: (
 			session: import("../src/lib/recordingSession").RecordingSession | null,
@@ -378,9 +402,17 @@ interface Window {
 		onMenuLoadProject: (callback: () => void) => () => void;
 		onMenuSaveProject: (callback: () => void) => () => void;
 		onMenuSaveProjectAs: (callback: () => void) => () => void;
+		/** Edit > Undo / Redo. On macOS the menu is the only route Cmd+Z has to the
+		 *  renderer at all — see `electron/edit-menu.ts`. */
+		onMenuUndo: (callback: () => void) => () => void;
+		onMenuRedo: (callback: () => void) => () => void;
 		quitApp: () => void;
 		setTitleBarOverlay: (color: string, symbolColor: string) => void;
 		getPlatform: () => string;
+		getAppInfo: () => Promise<{ version: string; canCheckForUpdates: boolean }>;
+		checkForUpdates: () => Promise<void>;
+		showAbout: () => Promise<void>;
+		canCheckForUpdatesNow: () => Promise<boolean>;
 		revealInFolder: (
 			filePath: string,
 		) => Promise<{ success: boolean; error?: string; message?: string }>;
@@ -395,6 +427,9 @@ interface Window {
 		hudOverlayHide: () => void;
 		hudOverlayClose: () => void;
 		setHudOverlayIgnoreMouseEvents: (ignore: boolean) => void;
+		/** Window-relative cursor position, pushed while the HUD is click-through and
+		 *  therefore receiving no pointer events of its own. Returns an unsubscribe. */
+		onHudOverlayCursor: (callback: (x: number, y: number) => void) => () => void;
 		/** Pins the overlay's current position as the origin for `dragHudOverlayTo`. */
 		beginHudOverlayDrag: () => void;
 		/** Total pointer travel since `beginHudOverlayDrag`, not a per-frame delta. */

@@ -1,6 +1,13 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BrowserWindow, ipcMain, screen } from "electron";
+import { app, BrowserWindow, ipcMain, screen } from "electron";
+import {
+	clampRectToWorkArea,
+	loadEditorWindowState,
+	resolveEditorCreation,
+	saveEditorWindowState,
+	shouldTrackEditorWindow,
+} from "./editorWindowState";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,12 +53,9 @@ const CONTENT_PROTECTION_FORCED = process.env["OPENSCREEN_FORCE_CONTENT_PROTECTI
  * older macOS — where it may well work — would be a privacy regression made on
  * no evidence.
  *
- * NOTE: this leaves the HUD capturable on macOS 26. Apple already made that
- * partly true regardless — ScreenCaptureKit ignores `sharingType`, so any
- * SCK-based recorder (including *ours*, see
- * `electron/native/screencapturekit/`) captures these windows anyway. The
- * durable fix is to exclude our own windows via `SCContentFilter`'s
- * `excludingWindows:`, which that helper currently passes as `[]`.
+ * ScreenCaptureKit ignores `sharingType`, so the native recorder independently
+ * excludes the HUD and Notes windows by their native IDs. This call remains the
+ * Windows protection and a second line of defence on older macOS releases.
  */
 const CONTENT_PROTECTION_BREAKS_DISPLAY = (() => {
 	if (process.platform !== "darwin") return false;
@@ -104,9 +108,75 @@ ipcMain.on("hud-overlay-hide", () => {
 	}
 });
 
+// The cursor, sampled here and pushed to the renderer, because while the HUD is
+// click-through nothing else can tell it where the pointer is.
+//
+// Chromium delivers no pointer event of any kind to a window it has made
+// input-transparent — including the pointermove the renderer needs to ask for input
+// back. Electron's `{ forward: true }` covered that with a global WH_MOUSE_LL hook
+// that re-posts WM_MOUSEMOVE, and that hook was the ONLY route out: its install is
+// unchecked (SetWindowsHookEx's return value is discarded), latched behind Electron's
+// `forwarding_mouse_messages_` so it re-arms only after a setIgnoreMouseEvents(false)
+// the renderer can no longer request, and Windows silently revokes any low-level hook
+// whose callback overruns LowLevelHooksTimeout — "there is no way for the application
+// to know whether the hook is removed". One hook that never installs or quietly dies
+// and the HUD is painted, inert, forever, with the tray icon as the only way to quit
+// the app. That is issue #266, and issue #385 after it: #266 was closed by moving
+// *when* the hook is installed, which left the trapdoor exactly where it was.
+//
+// So the escape no longer runs on anything Windows can take away. getCursorScreenPoint
+// is a plain positional read the main process can always make, the poll exists only
+// while the window is click-through — the state it is there to escape — and the
+// renderer re-derives the answer from scratch on every tick, so no dropped message,
+// dead hook or stale flag can strand it.
+const HUD_CURSOR_POLL_MS = 32;
+let hudCursorPoll: ReturnType<typeof setInterval> | null = null;
+let hudLastPoint: { x: number; y: number } | null = null;
+
+function stopHudCursorPoll() {
+	if (hudCursorPoll) clearInterval(hudCursorPoll);
+	hudCursorPoll = null;
+	hudLastPoint = null;
+}
+
+function pollHudCursor() {
+	const win = hudOverlayWindow;
+	if (!win || win.isDestroyed() || !win.isVisible() || win.isMinimized()) return;
+
+	// getBounds() and getCursorScreenPoint() are both in DIP, and so is a renderer CSS
+	// pixel (the HUD is frameless, so the client area is the whole window).
+	const bounds = win.getBounds();
+	const cursor = screen.getCursorScreenPoint();
+	const x = cursor.x - bounds.x;
+	const y = cursor.y - bounds.y;
+	if (x < 0 || y < 0 || x >= bounds.width || y >= bounds.height) return;
+
+	// Deduped on the WINDOW-RELATIVE point, not the cursor: "hud-overlay-set-size"
+	// re-anchors the window on every content change, so the bar can arrive under a
+	// cursor that never moved — and that changes the answer just as much.
+	if (hudLastPoint && hudLastPoint.x === x && hudLastPoint.y === y) return;
+	hudLastPoint = { x, y };
+
+	win.webContents.send("hud-overlay-cursor", x, y);
+}
+
 ipcMain.on("hud-overlay-ignore-mouse-events", (_event, ignore: boolean) => {
-	if (hudOverlayWindow && !hudOverlayWindow.isDestroyed()) {
-		hudOverlayWindow.setIgnoreMouseEvents(ignore, { forward: true });
+	if (!hudOverlayWindow || hudOverlayWindow.isDestroyed()) {
+		return;
+	}
+
+	// No `forward`: the poll above replaces it, and leaving it on would keep the app
+	// depending on a hook it cannot check for a transition it no longer needs.
+	hudOverlayWindow.setIgnoreMouseEvents(ignore);
+
+	if (!ignore) {
+		// Input is live again; the document's own pointer events are cheaper and
+		// finer-grained than anything sampled at 32 ms.
+		stopHudCursorPoll();
+		return;
+	}
+	if (!hudCursorPoll) {
+		hudCursorPoll = setInterval(pollHudCursor, HUD_CURSOR_POLL_MS);
 	}
 });
 
@@ -270,16 +340,9 @@ export function createHudOverlayWindow(): BrowserWindow {
 	// ready-to-show, so the two are ~85 ms apart — measured, not assumed). What that
 	// leaves open is an invisible rectangle that can swallow one desktop click in
 	// those 85 ms, right after the user launched the app — against what doing it here
-	// cost them: the whole app (issue #266). On Windows the `forward` option is a global
-	// WH_MOUSE_LL hook, and that hook is the only way out of the state, because
-	// Chromium sends no pointermove to a window it has made input-transparent — so
-	// the renderer can never ask to leave it on its own. Electron latches
-	// the install behind `forwarding_mouse_messages_` and retries only after a
-	// setIgnoreMouseEvents(false) — the very call a dead hook prevents. One refused
-	// or revoked hook (Windows drops any whose callback overruns the 300 ms
-	// LowLevelHooksTimeout — on this thread, still busy booting the app) and the HUD
-	// is painted, inert, forever. Asking later moves the install onto an IPC message,
-	// i.e. onto a main thread that is provably pumping.
+	// cost them: the whole app (issue #266). A window nothing ever asks for — a
+	// renderer that dies before mount — then stays clickable instead of becoming a
+	// ghost. See the "hud-overlay-cursor" poll above for the way back out.
 
 	// Keep the recording controls out of the recording (see applyContentProtection).
 	applyContentProtection(win, "HUD");
@@ -307,6 +370,7 @@ export function createHudOverlayWindow(): BrowserWindow {
 		if (hudOverlayWindow === win) {
 			hudOverlayWindow = null;
 			hudDragOrigin = null;
+			stopHudCursorPoll();
 		}
 	});
 
@@ -332,10 +396,18 @@ export function createHudOverlayWindow(): BrowserWindow {
  */
 export function createEditorWindow(query: Record<string, string> = {}): BrowserWindow {
 	const isMac = process.platform === "darwin";
+	const persist = shouldTrackEditorWindow(query);
+	const loaded = persist ? loadEditorWindowState(app.getPath("userData")) : null;
+	const saved = loaded
+		? {
+				...clampRectToWorkArea(loaded, screen.getDisplayMatching(loaded).workArea),
+				maximized: loaded.maximized,
+			}
+		: null;
+	const creation = resolveEditorCreation({ isBench: query.windowType === "bench", saved });
 
 	const win = new BrowserWindow({
-		width: 1200,
-		height: 800,
+		...creation.bounds,
 		minWidth: 800,
 		minHeight: 600,
 		// Seamless titlebar on every platform: the app's own topbar IS the titlebar
@@ -365,7 +437,23 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
 		},
 	});
 
-	win.maximize();
+	if (creation.maximize) win.maximize();
+	if (creation.persist) {
+		const persistState = () => {
+			if (win.isDestroyed()) return;
+			const bounds = win.getNormalBounds();
+			saveEditorWindowState(app.getPath("userData"), {
+				x: bounds.x,
+				y: bounds.y,
+				width: bounds.width,
+				height: bounds.height,
+				maximized: win.isMaximized(),
+			});
+		};
+		win.on("moved", persistState);
+		win.on("resized", persistState);
+		win.on("close", persistState);
+	}
 
 	// The editor renders its own File/Edit/View menu bar in the custom titlebar,
 	// so hide the native OS menu bar on Windows/Linux (it stays reachable via Alt).

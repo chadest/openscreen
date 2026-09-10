@@ -68,6 +68,26 @@ const HELPER_SOURCE_PATHS = [
  * `mac.extraResources` ships this directory wholesale (`filter: ["darwin-*​/*"]`), so
  * "present here" is the same thing as "present in the installed app".
  */
+/**
+ * L'exigence ONNX Runtime de macOS, séparée parce qu'elle ne vaut QUE sur arm64.
+ *
+ * L'amont ne publie aucun binaire ONNX pour les Macs Intel : `fetch-onnxruntime.mjs` le constate
+ * et sort en 0 sans rien poser. Un paquet x64 sans la bibliothèque est donc CORRECT, et l'exiger
+ * là ferait échouer à l'empaquetage une build parfaitement saine — la garde se retournerait
+ * contre ce qu'elle protège.
+ *
+ * Sur arm64 en revanche son absence ne casse rien de visible : `Segmenter::load` refuse, le
+ * compositeur dessine la webcam telle quelle, et le contrôle disparaît de l'éditeur. Le paquet
+ * est silencieusement amputé, ce qui est exactement la panne que cette garde existe pour
+ * attraper et qu'aucun test ne peut voir puisque tout se dégrade proprement.
+ */
+const MAC_ONNX_REQUIRED = {
+	match: (name) => name === "libonnxruntime.dylib",
+	what: "the ONNX Runtime library the camera-background segmentation loads",
+	breaks: "the camera-background control vanishes from the editor and every effect is a no-op",
+	fix: "Stage it with:\n\n    npm run fetch:onnxruntime",
+};
+
 const MAC_REQUIRED = [
 	{
 		match: (name) => name === "compositor_view.node",
@@ -75,12 +95,21 @@ const MAC_REQUIRED = [
 		breaks: "the preview and every export render nothing",
 		fix: FIX_MAC,
 	},
-	{
-		match: (name) => /^libav(codec|format|util)\.\d+\.dylib$/.test(name),
-		what: "the LGPL ffmpeg dylibs the compositor links",
+	// One requirement per library, not `atLeast: N` over a combined regex — the
+	// same trap LINUX_REQUIRED documents above. Several versioned copies of one
+	// library would satisfy a combined count while another was missing entirely,
+	// and the addon would still fail to load.
+	...["avcodec", "avformat", "avutil", "swresample", "swscale", "avfilter"].map((library) => ({
+		match: (name) => new RegExp(`^lib${library}\\.\\d+\\.dylib$`).test(name),
+		what: `the LGPL lib${library} dylib the compositor links`,
 		breaks: "the compositor addon cannot be loaded at all (dyld error at require())",
 		fix: FIX_MAC,
-		atLeast: 3,
+	})),
+	{
+		match: (name) => /^libavdevice\.\d+\.dylib$/.test(name),
+		what: "the LGPL libavdevice dylib the ffmpeg CLI links",
+		breaks: "ffmpeg dies in dyld before main(), so waveform and STT extraction cannot start",
+		fix: FIX_MAC,
 	},
 	{
 		match: (name) => name === "whisper-stt-server",
@@ -101,6 +130,14 @@ const MAC_REQUIRED = [
 		breaks: "native screen capture is unavailable",
 		fix: "Build it with:\n\n    npm run build:native:mac",
 	},
+	{
+		match: (name) => name === "ffmpeg",
+		what: "the LGPL ffmpeg CLI (spawned for waveform peaks and STT audio extraction)",
+		breaks:
+			"transcription falls back to the renderer decode or fails outright on machines with no\n" +
+			'system ffmpeg, shown to the user only as "Failed to fetch" (#616)',
+		fix: "Build it with:\n\n    npm run build:native:compositor:mac\n\nwhich stages the SDK's ffmpeg beside the vendored dylibs.",
+	},
 ];
 
 /**
@@ -119,6 +156,17 @@ const MAC_REQUIRED = [
  * `helper-ffmpeg/` subdirectory holds.
  */
 const LINUX_REQUIRED = [
+	// L'effet de fond de caméra est le seul dont la présence dépend d'un binaire optionnel, et
+	// son absence ne casse RIEN de visible : `Segmenter::load` refuse, le compositeur dessine la
+	// webcam telle quelle, et le contrôle disparaît de l'éditeur. Un paquet livré sans elle est
+	// donc silencieusement amputé — la panne exacte que cette garde existe pour attraper, et
+	// celle qu'aucun test ne peut voir puisque tout se dégrade proprement.
+	{
+		match: (name) => name === "libonnxruntime.so",
+		what: "the ONNX Runtime library the camera-background segmentation loads",
+		breaks: "the camera-background control vanishes from the editor and every effect is a no-op",
+		fix: "Stage it with:\n\n    npm run fetch:onnxruntime",
+	},
 	{
 		match: (name) => name === "compositor_view.node",
 		what: "the wgpu/Vulkan compositor addon",
@@ -131,7 +179,7 @@ const LINUX_REQUIRED = [
 	// pendant qu'une autre manquait. Le paquet passait alors la garde et le
 	// compositeur ne chargeait pas : exactement le mode de panne que cette garde
 	// existe pour attraper.
-	...["avcodec", "avformat", "avutil", "swresample", "swscale"].map((library) => ({
+	...["avcodec", "avformat", "avutil", "swresample", "swscale", "avfilter"].map((library) => ({
 		match: (name) => new RegExp(`^lib${library}\\.so\\.\\d+$`).test(name),
 		what: `the symbol-renamed lib${library} shared object the compositor links`,
 		breaks: "the compositor addon cannot be loaded at all (ld.so error at require())",
@@ -223,6 +271,17 @@ function checkNativePayload({ dir, required, osLabel, bundleNoun, emptyDirFix })
  * "together here" is the same thing as "together in the installed app".
  */
 const WIN_REQUIRED = [
+	// L'effet de fond de caméra est le seul dont la présence dépend d'un binaire optionnel, et
+	// son absence ne casse RIEN de visible : `Segmenter::load` refuse, le compositeur dessine la
+	// webcam telle quelle, et le contrôle disparaît de l'éditeur. Un paquet livré sans elle est
+	// donc silencieusement amputé — la panne exacte que cette garde existe pour attraper, et
+	// celle qu'aucun test ne peut voir puisque tout se dégrade proprement.
+	{
+		match: (name) => name === "onnxruntime.dll",
+		what: "the ONNX Runtime library the camera-background segmentation loads",
+		breaks: "the camera-background control vanishes from the editor and every effect is a no-op",
+		fix: "Stage it with:\n\n    npm run fetch:onnxruntime",
+	},
 	{
 		match: (name) => name === "compositor_view.node",
 		what: "the D3D11 compositor addon",
@@ -234,7 +293,7 @@ const WIN_REQUIRED = [
 	// (avcodec-60/61/62.dll left by an earlier fetch) would satisfy a combined count
 	// while another library was missing entirely, and the addon would still fail to
 	// load.
-	...["avcodec", "avformat", "avutil"].map((library) => ({
+	...["avcodec", "avformat", "avutil", "swresample", "swscale", "avfilter"].map((library) => ({
 		match: (name) => new RegExp(`^${library}-\\d+\\.dll$`).test(name),
 		what: `the ${library} DLL the compositor links`,
 		breaks: "the addon cannot be loaded at all under MSIX, which ignores PATH",
@@ -419,13 +478,22 @@ function checkWinNativePayload() {
 }
 
 function checkMacNativePayload(context) {
+	const arch = archTagFor(context);
+	const dir = path.join(ROOT, "electron", "native", "bin", `darwin-${arch}`);
 	checkNativePayload({
-		dir: path.join(ROOT, "electron", "native", "bin", `darwin-${archTagFor(context)}`),
-		required: MAC_REQUIRED,
+		dir,
+		// Voir `MAC_ONNX_REQUIRED` : exiger la bibliothèque sur Intel ferait échouer une build
+		// que l'amont rend impossible à satisfaire.
+		required: arch === "arm64" ? [...MAC_REQUIRED, MAC_ONNX_REQUIRED] : MAC_REQUIRED,
 		osLabel: "macOS",
 		bundleNoun: "the .app",
 		emptyDirFix: `${FIX_MAC}\n\nThe STT helper and the capture helper are separate builds — see\ntechnical-documentation/engineering/build-and-packaging.md.`,
 	});
+
+	// "Complete" is not the same property as "runnable on the macOS we claim". This file
+	// exists because a payload can be whole and still broken; a floor above the supported
+	// one is the second way that happens. See checkMacOsVersionFloor().
+	checkMacOsVersionFloor(dir);
 }
 
 function checkLinuxNativePayload(context) {
@@ -504,6 +572,40 @@ function checkLinuxNativePayload(context) {
  */
 const MAX_SYMBOL_VERSION = { GLIBC: "2.35", GLIBCXX: "3.4.30", CXXABI: "1.3.13" };
 
+/**
+ * The oldest macOS anything in the payload may demand — the macOS twin of
+ * MAX_SYMBOL_VERSION above, and the same class of bug on a different libc.
+ *
+ * Must equal `mac.minimumSystemVersion` in electron-builder.json5, which is what the .app
+ * tells LaunchServices; before-pack.test.mjs asserts exactly that, so the two cannot drift
+ * apart quietly. Not read from the config at runtime because this hook must keep working
+ * if that file is ever restructured — a guard that throws while parsing is a guard that
+ * gets deleted.
+ */
+const MAC_MIN_OS_FLOOR = "13.0";
+
+/**
+ * The one supported way past the ceiling, for the one case it does not fit: a developer
+ * on a distro newer than the floor, building a package for their own machine.
+ *
+ * Without it there is no way to get a .deb out of a working tree on, say, Ubuntu 24.04.
+ * `npm run build:whisper-binaries` links whisper/ggml against the host's glibc, so the
+ * guard refuses every local build and the only recourse is to push and wait for CI.
+ * That is a real cost — it means nobody can test a packaging change without a round
+ * trip — and it is what this exists to remove.
+ *
+ * `host` does NOT disable the check. It swaps the pinned ceiling for what this machine
+ * actually provides, so a payload needing something even the host lacks still fails.
+ * The guard keeps catching genuinely broken builds; it just stops pretending the
+ * developer is on Ubuntu 22.04. What it gives up is the distro-floor promise, which is
+ * exactly the promise a local build is not making.
+ *
+ * Refused outright under CI: an escape hatch that can reach a published artifact is not
+ * an escape hatch, it is a hole. The runners are pinned to the floor, so they never
+ * need it, and a release built with it set would be the bug this whole file prevents.
+ */
+const SYMBOL_FLOOR_MODE = process.env.OPENSCREEN_SYMBOL_FLOOR ?? "";
+
 /** Dotted numeric compare, so 3.4.9 < 3.4.30 and 2.4 < 2.38 rather than by string. */
 function compareVersions(a, b) {
 	const left = a.split(".").map(Number);
@@ -573,6 +675,139 @@ function neededSymbolVersions(file) {
 	return highest;
 }
 
+/**
+ * The mirror of neededSymbolVersions: what a library DEFINES (SHT_GNU_VERDEF) rather
+ * than what it asks for. Only used to read the host's own ceiling — a payload binary
+ * defines nothing interesting.
+ *
+ * Same hand-rolled parse as above, and for the same reason: this file already refuses
+ * to shell out to readelf, so that a missing binutils cannot turn the guard off.
+ */
+function definedSymbolVersions(file) {
+	const b = fs.readFileSync(file);
+	if (b.readUInt32BE(0) !== 0x7f454c46) throw new Error(`${file} is not an ELF binary`);
+	if (b[4] !== 2 || b[5] !== 1) throw new Error(`${file} is not 64-bit little-endian ELF`);
+
+	const shoff = Number(b.readBigUInt64LE(0x28));
+	const shentsize = b.readUInt16LE(0x3a);
+	const SHT_GNU_VERDEF = 0x6ffffffd;
+
+	let section;
+	for (let i = 0; i < b.readUInt16LE(0x3c); i++) {
+		const sh = shoff + i * shentsize;
+		if (b.readUInt32LE(sh + 4) !== SHT_GNU_VERDEF) continue;
+		// sh_info is the Verdef count; sh_link is the string table these names live in.
+		const strtabHeader = shoff + b.readUInt32LE(sh + 0x28) * shentsize;
+		section = {
+			offset: Number(b.readBigUInt64LE(sh + 0x18)),
+			count: b.readUInt32LE(sh + 0x2c),
+			strtab: Number(b.readBigUInt64LE(strtabHeader + 0x18)),
+		};
+		break;
+	}
+	if (!section) return {};
+
+	const nameAt = (at) =>
+		b.subarray(section.strtab + at, b.indexOf(0, section.strtab + at)).toString("latin1");
+
+	const highest = {};
+	let verdef = section.offset;
+	for (let i = 0; i < section.count; i++) {
+		// Verdef: vd_version(2) vd_flags(2) vd_ndx(2) vd_cnt(2) vd_hash(4) vd_aux(4) vd_next(4)
+		let verdaux = verdef + b.readUInt32LE(verdef + 12);
+		for (let j = 0; j < b.readUInt16LE(verdef + 6); j++) {
+			// Verdaux: vda_name(4) vda_next(4). The first entry of the first Verdef is the
+			// soname rather than a version, and it simply does not match the pattern.
+			const [, prefix, version] =
+				/^(.+)_(\d+(?:\.\d+)*)$/.exec(nameAt(b.readUInt32LE(verdaux))) ?? [];
+			if (prefix && (!highest[prefix] || compareVersions(version, highest[prefix]) > 0)) {
+				highest[prefix] = version;
+			}
+			verdaux += b.readUInt32LE(verdaux + 4);
+		}
+		verdef += b.readUInt32LE(verdef + 16);
+	}
+	return highest;
+}
+
+/**
+ * What THIS machine provides, read from the libraries node itself is running against —
+ * `process.report` gives their absolute paths, so there is nothing to guess at and no
+ * `ldconfig` to parse. node links both of the ones that matter.
+ */
+function hostSymbolCeiling() {
+	const providers = process.report
+		.getReport()
+		.sharedObjects.filter((so) => /\/lib(?:c|stdc\+\+)\.so\.6(?:\.\d+)*$/.test(so));
+
+	const ceiling = {};
+	for (const lib of providers) {
+		for (const [prefix, version] of Object.entries(definedSymbolVersions(lib))) {
+			if (!(prefix in MAX_SYMBOL_VERSION)) continue;
+			if (!ceiling[prefix] || compareVersions(version, ceiling[prefix]) > 0) {
+				ceiling[prefix] = version;
+			}
+		}
+	}
+
+	// Every prefix the pinned ceiling names has to come back, or the comparison below
+	// would quietly skip one and pass a payload nobody checked.
+	const missing = Object.keys(MAX_SYMBOL_VERSION).filter((prefix) => !ceiling[prefix]);
+	if (missing.length > 0) {
+		throw new Error(
+			`OPENSCREEN_SYMBOL_FLOOR=host could not read ${missing.join(", ")} from this machine.\n\n` +
+				`  looked in: ${providers.join(", ") || "(node reported no libc/libstdc++)"}\n\n` +
+				"Unset the variable to check against the pinned floor instead.",
+		);
+	}
+	return ceiling;
+}
+
+/**
+ * The ceiling this run compares against, plus whether it is the pinned one. Validates
+ * OPENSCREEN_SYMBOL_FLOOR here rather than at module load, so a stray value cannot
+ * break a Windows or macOS pack that never consults it.
+ */
+function resolveSymbolCeiling() {
+	if (SYMBOL_FLOOR_MODE === "") {
+		return { ceiling: MAX_SYMBOL_VERSION, pinned: true };
+	}
+	// An unrecognised value is an error, never a silent "enforce" or a silent "waive":
+	// a typo in the one variable that relaxes this guard must not decide either way.
+	if (SYMBOL_FLOOR_MODE !== "host") {
+		throw new Error(
+			`OPENSCREEN_SYMBOL_FLOOR=${SYMBOL_FLOOR_MODE} is not a value this guard knows.\n\n` +
+				'The only accepted value is "host": compare against this machine rather than the\n' +
+				"oldest supported distro, for a package you are building to run locally.\n" +
+				"Unset it to check against the pinned floor.",
+		);
+	}
+	if (process.env.CI) {
+		throw new Error(
+			"OPENSCREEN_SYMBOL_FLOOR=host is refused under CI.\n\n" +
+				"It exists so a developer on a newer distro can build a package for their own\n" +
+				"machine; a released artifact built with it would not start on the distros the\n" +
+				"README claims. The runners are pinned to the floor (build.yml build-linux,\n" +
+				"build-whisper-stt.yml), so nothing on CI needs it.",
+		);
+	}
+	return { ceiling: hostSymbolCeiling(), pinned: false };
+}
+
+// Exported for scripts/before-pack.test.mjs and nothing else. The two refusals above
+// are the only things standing between this escape hatch and a published package that
+// starts on nobody's machine but the builder's, and they are reachable from a test
+// without a payload to scan — so they are tested rather than trusted.
+exports.__testing = {
+	resolveSymbolCeiling,
+	MAX_SYMBOL_VERSION,
+	machoMinOs,
+	checkMacOsVersionFloor,
+	MAC_MIN_OS_FLOOR,
+	MAC_REQUIRED,
+	checkNativePayload,
+};
+
 /** Every ELF under `dir`, recursively — the helper's ffmpeg sits in a subdirectory. */
 function elfFilesUnder(dir) {
 	const found = [];
@@ -618,10 +853,29 @@ function checkLinuxSymbolVersionFloor(dir) {
 		);
 	}
 
+	// After the parser assertion on purpose: "does the pinned floor apply here" and "did
+	// the scan work at all" are unrelated questions, and the second is how this guard
+	// stays honest whichever ceiling it ends up using.
+	const { ceiling, pinned } = resolveSymbolCeiling();
+	if (!pinned) {
+		// Loud, because a relaxed guard that says nothing is indistinguishable from a
+		// guard that passed — and this one leaves a package that only runs here.
+		console.log(
+			`[before-pack] symbol-version ceiling taken from THIS MACHINE, not the pinned floor:\n` +
+				`  ${Object.entries(ceiling)
+					.map(([prefix, max]) => `${prefix}_${max}`)
+					.join(", ")}  (pinned floor: ${Object.entries(MAX_SYMBOL_VERSION)
+					.map(([prefix, max]) => `${prefix}_${max}`)
+					.join(", ")})\n` +
+				"  OPENSCREEN_SYMBOL_FLOOR=host is set. The package this produces may not start on\n" +
+				"  the distros the README claims — do not publish it.",
+		);
+	}
+
 	const offenders = scanned
 		.map((entry) => ({
 			name: entry.name,
-			bad: Object.entries(MAX_SYMBOL_VERSION)
+			bad: Object.entries(ceiling)
 				.filter(
 					([prefix, max]) => entry.needs[prefix] && compareVersions(entry.needs[prefix], max) > 0,
 				)
@@ -645,7 +899,164 @@ function checkLinuxSymbolVersionFloor(dir) {
 			"and build-whisper-stt.yml. To see which symbols pulled a version in:\n\n" +
 			"    readelf -V <file>\n" +
 			"    readelf -W --dyn-syms <file> | grep @GLIBC_2.38\n\n" +
+			(pinned
+				? "Building a package to run on THIS machine rather than to release? Set\n" +
+					"OPENSCREEN_SYMBOL_FLOOR=host, which compares against your own glibc instead of\n" +
+					"the floor. It is refused under CI, so it cannot reach a published artifact.\n\n"
+				: "") +
 			"Raising MAX_SYMBOL_VERSION drops a distro the README claims to support.",
+	);
+}
+
+/**
+ * The macOS minimum-OS a Mach-O declares, as "12.0", or null if it declares none.
+ *
+ * Reads LC_BUILD_VERSION (and LC_VERSION_MIN_MACOSX, which is what anything built
+ * against an older SDK carries) straight out of the file. Parsed here rather than
+ * shelled out to `vtool -show-build` for the same reason neededSymbolVersions() does not
+ * use readelf and importedDlls() does not use dumpbin — but with an extra one on top:
+ * this hook runs for the Windows and Linux packs too, and vtool exists on neither, so a
+ * subprocess would have to be skipped on exactly the hosts where skipping is silent.
+ * Parsing makes the guard host-independent instead of conditionally absent.
+ *
+ * Universal binaries are walked slice by slice and the HIGHEST floor wins: an x86_64 half
+ * built on a newer machine strands Intel users just as thoroughly as a thin binary would.
+ */
+function machoMinOs(file) {
+	const b = fs.readFileSync(file);
+	const FAT_MAGIC = 0xcafebabe;
+	const FAT_MAGIC_64 = 0xcafebabf;
+	const MH_MAGIC_64 = 0xfeedfacf;
+	const MH_MAGIC_32 = 0xfeedface;
+	const LC_VERSION_MIN_MACOSX = 0x24;
+	const LC_BUILD_VERSION = 0x32;
+	const PLATFORM_MACOS = 1;
+
+	/** X.Y.Z packed as nibbles: 0x000c0000 is 12.0.0. */
+	const decode = (packed) => `${packed >>> 16}.${(packed >> 8) & 0xff}.${packed & 0xff}`;
+
+	const sliceMinOs = (start) => {
+		const magic = b.readUInt32LE(start);
+		if (magic !== MH_MAGIC_64 && magic !== MH_MAGIC_32) return null;
+		const ncmds = b.readUInt32LE(start + 16);
+		// 32 bytes of mach_header_64 (28 + 4 bytes of `reserved`); 28 for the 32-bit one.
+		let off = start + (magic === MH_MAGIC_64 ? 32 : 28);
+		for (let i = 0; i < ncmds; i++) {
+			if (off + 8 > b.length) return null;
+			const cmd = b.readUInt32LE(off);
+			const cmdsize = b.readUInt32LE(off + 4);
+			if (cmdsize < 8) return null;
+			if (cmd === LC_BUILD_VERSION && b.readUInt32LE(off + 8) === PLATFORM_MACOS) {
+				return decode(b.readUInt32LE(off + 12));
+			}
+			if (cmd === LC_VERSION_MIN_MACOSX) {
+				return decode(b.readUInt32LE(off + 8));
+			}
+			off += cmdsize;
+		}
+		return null;
+	};
+
+	const fat = b.readUInt32BE(0);
+	if (fat === FAT_MAGIC || fat === FAT_MAGIC_64) {
+		const wide = fat === FAT_MAGIC_64;
+		const nfat = b.readUInt32BE(4);
+		let best = null;
+		for (let i = 0; i < nfat; i++) {
+			const entry = 8 + i * (wide ? 32 : 20);
+			const offset = wide ? Number(b.readBigUInt64BE(entry + 8)) : b.readUInt32BE(entry + 8);
+			const found = sliceMinOs(offset);
+			if (found && (!best || compareVersions(found, best) > 0)) best = found;
+		}
+		return best;
+	}
+
+	return sliceMinOs(0);
+}
+
+/** Every Mach-O under `dir`, recursively. Symlinks are skipped — see elfFilesUnder(). */
+function machoFilesUnder(dir) {
+	const found = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			found.push(...machoFilesUnder(full));
+			continue;
+		}
+		if (!entry.isFile()) continue;
+		// By magic, not by extension: the helpers and whisper-stt-server have none, and
+		// the ggml/whisper dylibs come as chains of symlinks onto one real file.
+		const magic = Buffer.alloc(4);
+		const fd = fs.openSync(full, "r");
+		try {
+			fs.readSync(fd, magic, 0, 4, 0);
+		} finally {
+			fs.closeSync(fd);
+		}
+		const le = magic.readUInt32LE(0);
+		const be = magic.readUInt32BE(0);
+		if (le === 0xfeedfacf || le === 0xfeedface || be === 0xcafebabe || be === 0xcafebabf) {
+			found.push(full);
+		}
+	}
+	return found;
+}
+
+/** Nothing we ship may demand a newer macOS than MAC_MIN_OS_FLOOR. */
+function checkMacOsVersionFloor(dir) {
+	const scanned = machoFilesUnder(dir).map((file) => ({
+		name: path.relative(dir, file),
+		minOs: machoMinOs(file),
+	}));
+
+	// Same assertion the Linux floor makes, for the same reason: a guard that quietly
+	// stops looking reports "clean" for the rest of the project's life. Every binary we
+	// ship is built with a deployment target, so reading none from any of them means the
+	// parser broke rather than that the payload is unusually clean.
+	if (scanned.length > 0 && !scanned.some((entry) => entry.minOs)) {
+		throw new Error(
+			`Refusing to package: read no macOS deployment target from any of the ${scanned.length} ` +
+				`Mach-O files in ${path.relative(ROOT, dir)}.\n\n` +
+				"Every one of them carries LC_BUILD_VERSION, so this is a bug in machoMinOs()\n" +
+				"(scripts/before-pack.cjs), not an unusually clean payload. Fix the parser — leaving\n" +
+				"it is how a build that cannot start on the supported macOS gets shipped again.",
+		);
+	}
+
+	const offenders = scanned.filter(
+		(entry) => entry.minOs && compareVersions(entry.minOs, MAC_MIN_OS_FLOOR) > 0,
+	);
+	if (offenders.length === 0) {
+		return;
+	}
+
+	throw new Error(
+		`Refusing to package binaries that demand a newer macOS than the ${MAC_MIN_OS_FLOOR} floor\n` +
+			"the app claims to support.\n\n" +
+			`  looked in: ${path.relative(ROOT, dir)}\n\n` +
+			`${offenders.map((o) => `  - ${o.name} is built for macOS ${o.minOs} (floor ${MAC_MIN_OS_FLOOR})`).join("\n")}\n\n` +
+			"Almost certainly nothing asked for this: clang and CMake default the deployment\n" +
+			"target to the BUILD MACHINE's SDK, so this usually means a build script forgot to\n" +
+			"pin one and the floor followed whatever image compiled it. CI's macos-latest moves\n" +
+			"on its own, so the same source can ship a different floor month to month.\n\n" +
+			"The number itself is not what breaks: dyld does NOT refuse a binary whose minos\n" +
+			"exceeds the running OS. The damage is done at link time — the deployment target\n" +
+			"decides which symbols the linker resolves against the OS instead of emitting\n" +
+			"locally, so a too-high floor leaves strong references to symbols the target macOS\n" +
+			"has never had, and the binary dies in dyld with 'Symbol not found'. That is issue\n" +
+			"#515: a helper built for 13 stranded every macOS 12 user, and the app reported it\n" +
+			"as a denied Accessibility permission.\n\n" +
+			"Pin the deployment target in whichever script built the file:\n\n" +
+			// Derived, not spelled out: this line said `.v12` for a while after the floor
+			// moved to 13, i.e. the guard's own remediation advice contradicted the floor
+			// it was enforcing.
+			`    Swift    platforms: [.macOS(.v${MAC_MIN_OS_FLOOR.split(".")[0]})]      electron/native/screencapturekit/Package.swift\n` +
+			"    CMake    -DCMAKE_OSX_DEPLOYMENT_TARGET  scripts/build-whisper-stt.sh\n" +
+			"    clang    -mmacosx-version-min           scripts/fetch-ffmpeg-macos.mjs\n" +
+			"    rustc    MACOSX_DEPLOYMENT_TARGET       scripts/build-macos-compositor-addon.mjs\n\n" +
+			"To see it yourself:\n\n" +
+			"    vtool -show-build <file>\n\n" +
+			`Raising MAC_MIN_OS_FLOOR drops a macOS version the README claims to support.`,
 	);
 }
 

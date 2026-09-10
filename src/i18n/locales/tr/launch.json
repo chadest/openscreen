@@ -6,8 +6,6 @@
 		"cancelRecording": "Kaydı iptal et",
 		"pauseRecording": "Kaydı duraklat",
 		"resumeRecording": "Kayda devam et",
-		"openVideoFile": "Video dosyası aç",
-		"openProject": "Proje aç",
 		"useVerticalTray": "Dikey araç çubuğunu kullan",
 		"useHorizontalTray": "Yatay araç çubuğunu kullan",
 		"openStudio": "Stüdyoyu aç",
@@ -58,6 +56,11 @@
 		"useEditableCursor": "Düzenlenebilir imleci kullan",
 		"useSystemCursor": "Sistem imlecini kullan"
 	},
+	"autoZoom": {
+		"enable": "Kayıttan sonra otomatik yakınlaştırmayı aç",
+		"disable": "Kayıttan sonra otomatik yakınlaştırmayı kapat",
+		"needsEditableCursor": "Otomatik yakınlaştırma düzenlenebilir imleç ister. Etkinleştirmek için imleç modunu değiştirin."
+	},
 	"sourceSelector": {
 		"loading": "Kaynaklar yükleniyor...",
 		"screens": "Ekranlar ({{count}})",
@@ -93,6 +96,9 @@
 		"micHint": "Mikrofonunuzu test etmek için konuşun",
 		"noMicrophones": "Mikrofon bulunamadı",
 		"preview": "Önizleme",
-		"previewUnavailable": "Önizleme kullanılamıyor"
+		"previewUnavailable": "Önizleme kullanılamıyor",
+		"about": "Hakkında",
+		"version": "Sürüm {{version}}",
+		"checkingForUpdates": "Denetleniyor…"
 	}
 }

@@ -4,11 +4,32 @@ import {
 	DEFAULT_CROP_REGION,
 	MAX_NATIVE_PLAYBACK_RATE,
 } from "@/components/video-editor/types";
-import { resolvePlaybackSegments } from "@/lib/ai-edition/document/timeline";
-import type { AxcutClip, AxcutTrimRange, AxcutZoomRegion } from "@/lib/ai-edition/schema";
+import {
+	collapseTracksToPills,
+	resolveFadeSecs,
+	trackGroupId,
+} from "@/lib/ai-edition/document/audioTracks";
+import {
+	projectRawTimelineSecToPlayback,
+	resolvePlaybackSegments,
+} from "@/lib/ai-edition/document/timeline";
+import type {
+	AxcutAudioTrack,
+	AxcutClip,
+	AxcutTrimRange,
+	AxcutZoomRegion,
+} from "@/lib/ai-edition/schema";
+import { audioGainScalar } from "@/lib/ai-edition/store/editorSettings";
 import { useEditorSettings } from "@/lib/ai-edition/store/useEditorSettings";
 import type { PlaybackClockRef } from "@/lib/ai-edition/timeline/playback-clock";
+import { removedRawSpans } from "@/lib/ai-edition/timeline/programme-time";
 import { findActiveSpeedRegion, type SpeedRegion } from "@/lib/ai-edition/timeline/speed";
+import {
+	consumedSourceSec,
+	type TakePiece,
+	takePlaybackAt,
+	takeProgramme,
+} from "@/lib/ai-edition/timeline/take-programme";
 import {
 	clampVirtualTime,
 	findNextKeptSegment,
@@ -23,12 +44,147 @@ import {
 	computeZoomPreviewTransform,
 	IDENTITY_ZOOM_TRANSFORM,
 } from "@/lib/ai-edition/timeline/zoom-preview";
+import {
+	describeMediaError,
+	formatMediaError,
+	mediaErrorDisposition,
+	pruneReloads,
+	retryDelayMs,
+} from "./mediaError";
 import styles from "./VirtualPreview.module.css";
 
 export interface VideoSource {
 	id: string;
 	src: string;
+	/** Original filesystem path, used by the main process to expose the second audio track. */
+	filePath?: string;
 	label: string;
+}
+
+/**
+ * Where an audio element should sit to track the video, and whether it should be playing.
+ *
+ * The audio elements mirror the video's own time — there is no offset to apply, because the
+ * only per-track difference that survives is length: the supplemental track is extracted
+ * separately and can end before the video does. Past its end the element is parked at its
+ * duration and paused rather than left seeking into nothing.
+ *
+ * Only an unusable duration falls back to Infinity — `NaN` before the element has its
+ * metadata, or a negative value. Zero is a real length, and the shortest track that is
+ * already over: an empty extraction has to read as ended, or the rAF loop below spends the
+ * whole timeline seeking and calling `play()` on an element that has nothing to play.
+ */
+export function resolveAudioTrackPlayback(
+	videoTimeSec: number,
+	durationSec = Number.POSITIVE_INFINITY,
+) {
+	const finiteDuration = Number.isFinite(durationSec) && durationSec >= 0 ? durationSec : Infinity;
+	return {
+		targetTimeSec: Math.min(Math.max(0, videoTimeSec), finiteDuration),
+		shouldPlay: videoTimeSec >= 0 && videoTimeSec < finiteDuration,
+	};
+}
+
+/**
+ * Where an imported audio track (issue #350) should sit against the playback
+ * clock, and whether it should be playing there. Both arguments are in
+ * trim-compressed OUTPUT-programme seconds: `outputTimeSec` is the playhead and
+ * `outputStartSec` is the track's head, each already projected from raw through
+ * the trims by `projectRawTimelineSecToPlayback` in the caller.
+ *
+ * The track plays as one CONTIGUOUS block: `[outputStartSec, outputStartSec +
+ * (trimEnd - trimStart)]`, its source position `trimStart` plus how far the
+ * playhead is past the head. Outside that span it parks at the nearer trim edge
+ * and stays paused, the same discipline `resolveAudioTrackPlayback` uses so the
+ * rAF never seeks an element into nothing.
+ *
+ * Working in output space is what keeps the preview identical to the export: the
+ * native `audio::mix_external_tracks` overlays the decoded window
+ * `[trimStart, trimEnd]` contiguously at its projected offset, so an interior
+ * trim shortens the programme UNDER the track without cutting the track's own
+ * content. Deriving `local` from the RAW playhead instead (which jumps across a
+ * cut) made the element skip that much source and end early — the preview/export
+ * desync this fixes.
+ */
+export function resolveTimelineAudioPlayback(
+	outputTimeSec: number,
+	outputStartSec: number,
+	track: AxcutAudioTrack,
+	/** The fragment's own span in seconds — how long it plays on the timeline,
+	 *  which is independent of how much file is left after the offset. */
+	spanSec: number,
+) {
+	const offset = Math.max(0, track.offsetMs / 1000);
+	const sourceEnd = track.durationSec > 0 ? track.durationSec : offset + spanSec;
+	// The window the file has left after the offset; the fragment stops at
+	// whichever runs out first, its span or the file.
+	const windowLen = Math.max(0, sourceEnd - offset);
+	const local = outputTimeSec - outputStartSec;
+	const active = local >= 0 && local < spanSec;
+	if (track.loop && windowLen > 0) {
+		// Fold into the repeating window, exactly as the export's per-repeat mix
+		// entries do, so preview and render stay in phase.
+		return {
+			targetTimeSec: offset + (local > 0 ? local % windowLen : 0),
+			shouldPlay: active,
+		};
+	}
+	return {
+		targetTimeSec: Math.min(Math.max(offset, offset + local), sourceEnd),
+		// A file shorter than its span goes silent at the end rather than
+		// restarting: seeking a finished element back would stutter it every frame.
+		shouldPlay: active && local < windowLen,
+	};
+}
+
+/** Fraction 0..1 of a track's volume `localSec` into its span, applying the
+ *  ramps. Shares `resolveFadeSecs` with the export so a fade too long for its
+ *  span is reduced the same way on both sides. */
+export function timelineAudioFadeAt(
+	track: AxcutAudioTrack,
+	localSec: number,
+	spanSec: number,
+): number {
+	if (track.muted) return 0;
+	const { fadeInSec, fadeOutSec } = resolveFadeSecs(track.fadeInMs, track.fadeOutMs, spanSec);
+	let v = 1;
+	if (fadeInSec > 0 && localSec < fadeInSec) v = Math.min(v, Math.max(0, localSec / fadeInSec));
+	if (fadeOutSec > 0) {
+		const remaining = spanSec - localSec;
+		if (remaining < fadeOutSec) v = Math.min(v, Math.max(0, remaining / fadeOutSec));
+	}
+	return v;
+}
+
+export interface PreviewAudioGraph {
+	context: AudioContext;
+	gain: GainNode;
+}
+
+/**
+ * The preview's ONLY audio processing is the output trim, and that is deliberate: it is
+ * the same `10 ** (dB / 20)` scalar `finish_audio` applies natively, so what the editor
+ * plays is what the export writes.
+ *
+ * Nothing with state belongs here. The export runs on the assembled timeline (trimmed,
+ * speed-adjusted, concatenated); the preview runs on the untouched source file, seeked.
+ * A filter or a compressor would see a different signal on each side and drift — and an
+ * offline stage measured over the whole programme (a loudness normaliser) cannot exist
+ * here at all, because the preview never holds that programme.
+ */
+export function applyPreviewAudioSettings(
+	graph: PreviewAudioGraph | null,
+	elements: Array<HTMLAudioElement | null>,
+	gainDb: number,
+): void {
+	const outputGain = audioGainScalar(gainDb);
+	if (!graph) {
+		for (const element of elements) {
+			if (element) element.volume = Math.min(1, outputGain);
+		}
+		return;
+	}
+	graph.gain.gain.value = outputGain;
 }
 
 /** First clip (by timeline order) starting strictly after `afterTimelineStartSec` —
@@ -47,6 +203,11 @@ function findNextClipByTimelineOrder(
 
 interface VirtualPreviewProps {
 	videoSources: VideoSource[];
+	/** Imported audio tracks to mix over the video (issue #350), and the file URLs
+	 *  their assets resolve to (keyed by assetId in `id`). Both default to empty, so
+	 *  a project with no imported audio behaves exactly as before. */
+	audioTracks?: AxcutAudioTrack[];
+	audioSources?: VideoSource[];
 	clips: AxcutClip[];
 	zoomRegions?: AxcutZoomRegion[];
 	speedRegions?: SpeedRegion[];
@@ -63,8 +224,20 @@ interface VirtualPreviewProps {
 	videoStyle?: React.CSSProperties;
 	/** Called with the id of the asset that failed, not as a bare "the preview is
 	 *  broken" signal: only ONE source is mounted at a time (`activeSource`), so
-	 *  the caller has no other way to tell which of its sources is dead. */
-	onVideoError?: (assetId: string) => void;
+	 *  the caller has no other way to tell which of its sources is dead.
+	 *  Fires only once the retry budget below is spent — a transient decode or
+	 *  network blip is reloaded here and never reaches the caller. `detail`
+	 *  carries the MediaError code for the card and for bug reports. */
+	onVideoError?: (assetId: string, detail: string) => void;
+	/** The mounted source produced a frame again — after a reload, or simply
+	 *  because the playhead moved onto a healthy asset. The caller needs this to
+	 *  drop a failure it is showing; without it, a card outlives its failure and
+	 *  we are back to a latch, only quieter. */
+	onVideoRecovered?: (assetId: string) => void;
+	/** Bumped by the caller's Retry button. A user-initiated reload always runs:
+	 *  it cancels any pending backoff and starts the budget over, because the
+	 *  user clicked knowing something changed (they put the file back). */
+	retryToken?: number;
 	/** Crop of the active clip, as fractions (0-1) of the source frame. Absent/
 	 * identity ({x:0,y:0,width:1,height:1}) renders the full frame, unchanged
 	 * from before crop support existed. */
@@ -79,6 +252,8 @@ interface VirtualPreviewProps {
 
 export function VirtualPreview({
 	videoSources,
+	audioTracks = [],
+	audioSources = [],
 	clips,
 	zoomRegions = [],
 	speedRegions = [],
@@ -89,6 +264,8 @@ export function VirtualPreview({
 	onVideoElement,
 	videoStyle,
 	onVideoError,
+	onVideoRecovered,
+	retryToken,
 	cropRegion,
 	clockRef,
 }: VirtualPreviewProps) {
@@ -114,10 +291,48 @@ export function VirtualPreview({
 				top: `${(-region.y * 100) / region.height}%`,
 			};
 	const videoRef = useRef<HTMLVideoElement | null>(null);
+	const primaryAudioRef = useRef<HTMLAudioElement | null>(null);
+	const supplementalAudioRef = useRef<HTMLAudioElement | null>(null);
+	const [primaryAudioEl, setPrimaryAudioEl] = useState<HTMLAudioElement | null>(null);
+	const [supplementalAudioEl, setSupplementalAudioEl] = useState<HTMLAudioElement | null>(null);
+	const [supplementalAudioSrc, setSupplementalAudioSrc] = useState<string | null>(null);
+	const [audioProbeComplete, setAudioProbeComplete] = useState(false);
+	const audioGainDbRef = useRef(settings.audioGainDb);
+	useEffect(() => {
+		audioGainDbRef.current = settings.audioGainDb;
+	}, [settings.audioGainDb]);
+	const audioContextRef = useRef<AudioContext | null>(null);
+	const audioContextCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const audioSourceNodesRef = useRef(new WeakMap<HTMLAudioElement, MediaElementAudioSourceNode>());
+	// Per-track gain nodes for imported audio (issue #350). Keyed by track id so the rAF
+	// can set each track's level live (a boost past 0 dB, which `element.volume` can't do —
+	// same reason the primary/supplemental sum through a gain node). The graph effect owns
+	// their lifecycle; the map is cleared and rebuilt whenever the routing is torn down.
+	const audioTrackGainNodesRef = useRef<Map<string, GainNode>>(new Map());
+	const audioGraphRef = useRef<PreviewAudioGraph | null>(null);
 	const videoFrameRef = useRef<HTMLDivElement | null>(null);
 
 	const isProgrammaticSeekRef = useRef(false);
+	// The seek that arrived while another was still running (see applySourceTime).
+	const pendingScrubTargetRef = useRef<number | null>(null);
 	const pendingSeekRef = useRef<{ sourceTimeSec: number; play: boolean } | null>(null);
+	// When each AUTOMATIC reload happened. The budget is "reloads inside
+	// RELOAD_WINDOW_MS", so it expires by itself: a dead file burns it in
+	// seconds, while the occasional transient across a long editing session
+	// never accumulates. A lifetime count could not tell those apart and would
+	// eventually show a card on healthy media (see mediaError.ts).
+	const reloadsRef = useRef<number[]>([]);
+	// Set when we stop trying, so an expiring window cannot restart the cycle
+	// behind the card. Cleared only by Retry or a media change.
+	const gaveUpRef = useRef(false);
+	const retryTimerRef = useRef<number | null>(null);
+	// True from the moment a reload is scheduled until the element produces
+	// metadata again. Read by the rAF tick, which must not steer a dead decoder.
+	const recoveringRef = useRef(false);
+	// The last position read off a healthy element. `video.currentTime` is 0
+	// after load(), and 0 after a load that failed before decoding a frame, so
+	// it cannot be the fallback resume point — that is a silent rewind.
+	const lastGoodSourceTimeRef = useRef(0);
 	// Which clip the rAF tick below believes is currently playing — set
 	// whenever a seek unambiguously resolves one (via locateVirtualPosition,
 	// timeline position → clip). Passed back into locateSourcePosition so
@@ -132,6 +347,181 @@ export function VirtualPreview({
 
 	const virtualDurationSec = useMemo(() => totalVirtualDuration(clips), [clips]);
 	const activeSource = videoSources[sourceIndex] ?? null;
+
+	useEffect(() => {
+		let cancelled = false;
+		setSupplementalAudioSrc(null);
+		setAudioProbeComplete(false);
+		if (!activeSource?.filePath || !window.electronAPI?.preparePreviewAudioTrack) {
+			setAudioProbeComplete(true);
+			return () => {
+				cancelled = true;
+			};
+		}
+		void window.electronAPI.preparePreviewAudioTrack(activeSource.filePath).then(
+			(result) => {
+				if (cancelled) return;
+				setSupplementalAudioSrc(result.success ? (result.path ?? null) : null);
+				setAudioProbeComplete(true);
+			},
+			() => {
+				if (cancelled) return;
+				setSupplementalAudioSrc(null);
+				setAudioProbeComplete(true);
+			},
+		);
+		return () => {
+			cancelled = true;
+		};
+	}, [activeSource?.filePath]);
+
+	// Which imported-track elements are actually mounted (a track is rendered only once its
+	// asset URL resolves — see the JSX). Re-routing the graph is keyed on this set, NOT on the
+	// tracks' gains: a level change is applied live on the existing node by the rAF, so it must
+	// not tear the graph down. Joined ids change only on a real mount/unmount.
+	const mountedAudioTrackKey = audioTracks
+		.filter((track) => audioSources.some((source) => source.id === track.assetId))
+		.map((track) => track.id)
+		.join(",");
+
+	// Sum the audio elements into one gain node so the output trim can boost past 0 dB,
+	// which `element.volume` cannot do. The primary media element carries track 1; on macOS
+	// the existing IPC helper extracts track 2 (normally the microphone) so both are audible
+	// instead of Chromium silently choosing one. Imported tracks (issue #350) join the same
+	// graph through a per-track gain node so their boost survives the preview too.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mountedAudioTrackKey is the trigger for re-routing tracks; the elements are read from the ref.
+	useEffect(() => {
+		if (!primaryAudioEl || !audioProbeComplete) return;
+		if (supplementalAudioSrc && !supplementalAudioEl) return;
+		const elements = [primaryAudioEl, supplementalAudioEl].filter(
+			(value): value is HTMLAudioElement => Boolean(value),
+		);
+		const graph = ((): PreviewAudioGraph | null => {
+			try {
+				let context = audioContextRef.current;
+				if (!context || context.state === "closed") {
+					context = new AudioContext();
+					audioContextRef.current = context;
+					audioSourceNodesRef.current = new WeakMap();
+				}
+				const gain = context.createGain();
+				gain.connect(context.destination);
+				return { context, gain };
+			} catch {
+				return null;
+			}
+		})();
+		if (!graph) {
+			// WebAudio can be unavailable in unit tests or under a denied audio policy. No source
+			// node was created, so `volume` still reaches the output — capped at 0 dB.
+			applyPreviewAudioSettings(null, elements, audioGainDbRef.current);
+			return;
+		}
+
+		const connectedSources: MediaElementAudioSourceNode[] = [];
+		for (const element of elements) {
+			try {
+				let source = audioSourceNodesRef.current.get(element);
+				if (!source) {
+					source = graph.context.createMediaElementSource(element);
+					audioSourceNodesRef.current.set(element, source);
+				}
+				source.disconnect();
+				source.connect(graph.gain);
+				connectedSources.push(source);
+			} catch {
+				// Routing THIS element failed; leave the others alone. Once
+				// createMediaElementSource has run for an element its audio no longer reaches
+				// the default output, so tearing the whole graph down here would mute the
+				// preview outright rather than degrade it.
+			}
+		}
+		// Imported tracks (issue #350): each mounted element gets source → per-track gain →
+		// the output gain, so the effective level is trackGain × outputGain — the same order
+		// the exporter mixes in (mix_external_tracks applies the track gain, finish_audio the
+		// output gain). The rAF sets each node's value; created here at unity as a safe default.
+		const trackGainNodes: GainNode[] = [];
+		audioTrackGainNodesRef.current = new Map();
+		for (const [trackId, element] of audioTrackElsRef.current) {
+			try {
+				let source = audioSourceNodesRef.current.get(element);
+				if (!source) {
+					source = graph.context.createMediaElementSource(element);
+					audioSourceNodesRef.current.set(element, source);
+				}
+				source.disconnect();
+				const trackGain = graph.context.createGain();
+				source.connect(trackGain);
+				trackGain.connect(graph.gain);
+				audioTrackGainNodesRef.current.set(trackId, trackGain);
+				connectedSources.push(source);
+				trackGainNodes.push(trackGain);
+			} catch {
+				// Same rationale as the primary/supplemental loop: routing THIS track failed, so
+				// leave the rest connected. The rAF falls back to `element.volume` for a track
+				// with no gain node (capped at 0 dB, but audible).
+			}
+		}
+		audioGraphRef.current = graph;
+		applyPreviewAudioSettings(graph, elements, audioGainDbRef.current);
+		return () => {
+			audioGraphRef.current = null;
+			for (const source of connectedSources) source.disconnect();
+			for (const trackGain of trackGainNodes) trackGain.disconnect();
+			audioTrackGainNodesRef.current = new Map();
+			graph.gain.disconnect();
+		};
+	}, [
+		primaryAudioEl,
+		supplementalAudioEl,
+		supplementalAudioSrc,
+		audioProbeComplete,
+		mountedAudioTrackKey,
+	]);
+
+	// Keep one AudioContext for the component. Closing and recreating it on an effect rerun
+	// permanently silences an HTMLAudioElement because createMediaElementSource may only be
+	// called once for that element. Delay final cleanup by one task so React StrictMode's
+	// intentional setup → cleanup → setup cycle can cancel the close and reuse the context.
+	useEffect(() => {
+		if (audioContextCloseTimerRef.current) {
+			clearTimeout(audioContextCloseTimerRef.current);
+			audioContextCloseTimerRef.current = null;
+		}
+		return () => {
+			// Nothing to tear down means nothing to schedule. WebAudio is unavailable
+			// under jsdom and under a denied audio policy, so this ref is often still
+			// null — and an unmount that leaves a timer behind for a context that was
+			// never created is both waste and a lie to anyone counting timers to prove
+			// this component cleans up after itself (see VirtualPreview.mediaError).
+			if (!audioContextRef.current) return;
+			audioContextCloseTimerRef.current = setTimeout(() => {
+				audioContextCloseTimerRef.current = null;
+				const context = audioContextRef.current;
+				audioContextRef.current = null;
+				audioSourceNodesRef.current = new WeakMap();
+				audioTrackGainNodesRef.current = new Map();
+				if (context) void context.close();
+			}, 0);
+		};
+	}, []);
+
+	useEffect(() => {
+		applyPreviewAudioSettings(
+			audioGraphRef.current,
+			[primaryAudioRef.current, supplementalAudioRef.current],
+			settings.audioGainDb,
+		);
+	}, [settings.audioGainDb]);
+
+	const setPrimaryAudioElement = useCallback((element: HTMLAudioElement | null) => {
+		primaryAudioRef.current = element;
+		setPrimaryAudioEl(element);
+	}, []);
+	const setSupplementalAudioElement = useCallback((element: HTMLAudioElement | null) => {
+		supplementalAudioRef.current = element;
+		setSupplementalAudioEl(element);
+	}, []);
 
 	// ponytail: the cursor overlay wants source-media time (the recorded
 	// cursor samples live on the original mp4 timeline, not the edited
@@ -159,6 +549,35 @@ export function VirtualPreview({
 	// mutation.
 	const clipsRef = useRef(clips);
 	clipsRef.current = clips;
+	// Same reason as `clipsRef`: the rAF projects the playhead and each imported
+	// audio track's head raw→output every frame (see the audio-track loop), and
+	// must see the live trims, not the set captured when the loop was created.
+	const trimRangesRef = useRef(trimRanges);
+	trimRangesRef.current = trimRanges;
+	// What the film no longer contains, recomputed only when the cuts move — the rAF asks
+	// it once per voiceover per frame, and walking every trim there would be wasteful.
+	// The film's pauses, placed on the raw ruler once. The projection needs them or every
+	// track after a pause lands D seconds early — the bug this argument exists to close.
+	// One walk per take, recomputed only when the cuts or the insertions move. The rAF asks
+	// it every frame per track, and walking on each would be wasteful.
+	const takePiecesRef = useRef<Map<string, TakePiece[]>>(new Map());
+	const takeHeadsRef = useRef<Map<string, string>>(new Map());
+	const removedRef = useRef(removedRawSpans(clips, trimRanges));
+	removedRef.current = useMemo(() => removedRawSpans(clips, trimRanges), [clips, trimRanges]);
+	const takeWalks = useMemo(() => {
+		const pieces = new Map<string, TakePiece[]>();
+		const heads = new Map<string, string>();
+		const removed = removedRawSpans(clips, trimRanges);
+		for (const pill of collapseTracksToPills(audioTracks)) {
+			if (pill.kind !== "voiceover" || pill.loop) continue;
+			const groupId = trackGroupId(pill);
+			heads.set(groupId, pill.id);
+			pieces.set(groupId, takeProgramme(pill, removed));
+		}
+		return { pieces, heads };
+	}, [audioTracks, clips, trimRanges]);
+	takePiecesRef.current = takeWalks.pieces;
+	takeHeadsRef.current = takeWalks.heads;
 	// Trim-narrowed (`resolvePlaybackSegments`) — used ONLY to detect "has the <video>'s own
 	// currentTime drifted into a trim" and where to jump it back out to. Everything ELSE in
 	// this component (`clips`/`clipsRef` above, virtualTimeSec, zoom/speed region lookups,
@@ -185,6 +604,17 @@ export function VirtualPreview({
 	virtualDurationSecRef.current = virtualDurationSec;
 	const speedRegionsRef = useRef(speedRegions);
 	speedRegionsRef.current = speedRegions;
+	// Imported audio tracks (issue #350): the rAF reads these through refs, same as
+	// everything else it touches, so a track added/edited mid-playback is picked up
+	// without re-creating the loop. `audioTrackElsRef` maps a track id to its mounted
+	// <audio> element (registered by the ref callback on render).
+	const audioTracksRef = useRef(audioTracks);
+	audioTracksRef.current = audioTracks;
+	const audioTrackElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+	const registerAudioTrackEl = useCallback((trackId: string, element: HTMLAudioElement | null) => {
+		if (element) audioTrackElsRef.current.set(trackId, element);
+		else audioTrackElsRef.current.delete(trackId);
+	}, []);
 	// Same reasoning as `clipsRef` above, for the one thing the rAF calls rather than reads:
 	// `seekToVirtualTime` is a `useCallback` whose deps include `clips`, so it takes a new
 	// identity on every clip mutation — a REORDER included. The rAF below is deliberately
@@ -209,6 +639,150 @@ export function VirtualPreview({
 			if (!v || !Number.isFinite(v.currentTime)) {
 				return;
 			}
+			for (const audio of [primaryAudioRef.current, supplementalAudioRef.current]) {
+				if (!audio) continue;
+				const target = resolveAudioTrackPlayback(v.currentTime, audio.duration);
+				if (audio.playbackRate !== v.playbackRate) audio.playbackRate = v.playbackRate;
+				if (Math.abs(audio.currentTime - target.targetTimeSec) > 0.025) {
+					try {
+						audio.currentTime = target.targetTimeSec;
+					} catch {
+						// media metadata not ready yet
+					}
+				}
+				if (!v.paused && target.shouldPlay && audio.paused) {
+					if (audioGraphRef.current?.context.state === "suspended") {
+						void audioGraphRef.current.context.resume();
+					}
+					const playback = audio.play();
+					if (playback) void playback.catch(() => undefined);
+				} else if ((v.paused || !target.shouldPlay) && !audio.paused) {
+					audio.pause();
+				}
+			}
+			// Imported audio tracks (issue #350): project the playhead raw→output
+			// once, then position each track as a contiguous block against that
+			// output clock (see `resolveTimelineAudioPlayback`) so an interior trim
+			// shortens the programme without cutting the track — identical to the
+			// export's `mix_external_tracks`. Play it only inside its window, and set
+			// its level from the track gain. When the WebAudio graph is up the level
+			// rides a per-track gain node (which CAN boost past 0 dB, and the output node
+			// applies the global gain on top, matching the export); the `.volume` path is
+			// the fallback for when the graph is unavailable — there a boost caps at 0 dB.
+			const globalGain = audioGainScalar(audioGainDbRef.current);
+			// Speed-aware: under a 2x region the raw playhead races, and a projection
+			// blind to speed raced the audio's target position with it — the track
+			// was never given a faster `playbackRate`, but seeking it twice as fast
+			// amounts to the same thing. Dividing raw time by the rate turns that
+			// back into 1x wall-clock, which is what the render does too.
+			const outputTimeSec = projectRawTimelineSecToPlayback(
+				clipsRef.current,
+				trimRangesRef.current,
+				virtualTimeSecRef.current,
+				speedRegionsRef.current,
+			);
+			for (const track of audioTracksRef.current) {
+				const el = audioTrackElsRef.current.get(track.id);
+				if (!el) continue;
+				const outputStartSec = projectRawTimelineSecToPlayback(
+					clipsRef.current,
+					trimRangesRef.current,
+					track.startMs / 1000,
+					speedRegionsRef.current,
+				);
+				// Length is measured WITHOUT speed, position WITH it. A trim REMOVES
+				// timeline — a track buried in one has zero length and stays silent,
+				// rather than playing its full raw length parked at the cut. A speed
+				// region only COMPRESSES: the track still holds all its audio and
+				// still plays at 1x, so it must not be cut short because the video
+				// under it was sped up.
+				const spanSec = Math.max(
+					0,
+					projectRawTimelineSecToPlayback(
+						clipsRef.current,
+						trimRangesRef.current,
+						track.endMs / 1000,
+					) -
+						projectRawTimelineSecToPlayback(
+							clipsRef.current,
+							trimRangesRef.current,
+							track.startMs / 1000,
+						),
+				);
+				// A voiceover follows the cuts AND its own insertions, through one walk over
+				// its PILL. Every fragment but the head is silenced: the document keeps one
+				// per clip the take covers, and letting each play its own slice would put the
+				// take on top of itself, exactly as it would in the export.
+				//
+				// A bed plays through a cut and ends early, on purpose. A looping voiceover
+				// keeps the bed's treatment — step 6 of #560 refuses that combination, and
+				// inventing semantics for it would be the worse answer.
+				const takeGroupId = trackGroupId(track);
+				const takePieces =
+					track.kind === "voiceover" && !track.loop
+						? takePiecesRef.current.get(takeGroupId)
+						: undefined;
+				if (takePieces && takeHeadsRef.current.get(takeGroupId) !== track.id) {
+					if (!el.paused) el.pause();
+					continue;
+				}
+				const trackTarget = takePieces
+					? (takePlaybackAt(takePieces, virtualTimeSecRef.current) ?? {
+							targetTimeSec: track.offsetMs / 1000,
+							shouldPlay: false,
+						})
+					: resolveTimelineAudioPlayback(outputTimeSec, outputStartSec, track, spanSec);
+				// Fades measure against the SOURCE the walk consumes, never the take's ruler
+				// extent: an insertion grows the extent without adding a second of file, and
+				// a fade-out measured on it would start early here and nowhere else.
+				const fadeSpanSec = takePieces ? consumedSourceSec(takePieces) : spanSec;
+				const fadeLocalSec = takePieces
+					? Math.max(0, trackTarget.targetTimeSec - track.offsetMs / 1000)
+					: outputTimeSec - outputStartSec;
+				const fade = timelineAudioFadeAt(track, fadeLocalSec, fadeSpanSec);
+				// Imported audio plays at its natural 1× rate, NOT the video's. The export
+				// sums it into the programme at 1× — speed regions stretch clip PCM only,
+				// never the imported track — so following `v.playbackRate` would pitch a
+				// voiceover up under a 2× region and finish it early, diverging from export.
+				if (el.playbackRate !== 1) el.playbackRate = 1;
+				const trackGainNode = audioTrackGainNodesRef.current.get(track.id);
+				if (trackGainNode) {
+					trackGainNode.gain.value = audioGainScalar(track.gainDb) * fade;
+					if (el.volume !== 1) el.volume = 1;
+				} else {
+					el.volume = Math.min(1, audioGainScalar(track.gainDb) * globalGain * fade);
+				}
+				// Only re-seek on a real discontinuity (a scrub, a trim jump, a first
+				// play), NOT on the sub-frame drift of normal playback. The primary audio
+				// can afford a 25 ms leash because it syncs to the <video>'s own
+				// authoritative clock; an imported track syncs to `virtualTimeSec`, which is
+				// DERIVED from that clock each frame and so is slightly noisy — at a 25 ms
+				// leash it re-seeks most frames, and each seek briefly stalls the element:
+				// the jitter. A started element already plays at the right rate from the
+				// right offset, so it free-runs in sync; this wide leash just catches the
+				// jumps. BGM/voiceover tolerates it; frame-tight sync is the video's job.
+				const leashSec = !el.paused && trackTarget.shouldPlay ? 0.3 : 0.025;
+				if (Math.abs(el.currentTime - trackTarget.targetTimeSec) > leashSec) {
+					try {
+						el.currentTime = trackTarget.targetTimeSec;
+					} catch {
+						// media metadata not ready yet
+					}
+				}
+				if (!v.paused && trackTarget.shouldPlay && el.paused) {
+					// Resume a context suspended by autoplay policy, exactly as the primary
+					// loop does above — otherwise a track that starts while the primary
+					// element is silent (its span is over, or a recording with no separate
+					// audio element) routes into a suspended context and plays nothing.
+					if (audioGraphRef.current?.context.state === "suspended") {
+						void audioGraphRef.current.context.resume();
+					}
+					const playback = el.play();
+					if (playback) void playback.catch(() => undefined);
+				} else if ((v.paused || !trackTarget.shouldPlay) && !el.paused) {
+					el.pause();
+				}
+			}
 			// Publish this frame's live position/rate for other media elements
 			// (webcam) to read directly — see playback-clock.ts for why this
 			// bypasses React state entirely.
@@ -217,6 +791,18 @@ export function VirtualPreview({
 				clockRef.current.isPlaying = !v.paused;
 				clockRef.current.playbackRate = v.playbackRate;
 				clockRef.current.virtualTimeSec = virtualTimeSecRef.current;
+			}
+			// A reload is in flight: the decoder is dead and `currentTime` is
+			// frozen (or already reset to 0), so every decision below — trim
+			// skipping, the clip-boundary advance, the unmapped-position
+			// fallback — would be taken on a lie, and the seeks two of them fire
+			// would clobber the resume queued for the reload. Deliberately BELOW
+			// the clock publish: the webcam overlay freezes on the last good
+			// position rather than jumping. Note this cannot ride on `v.paused`,
+			// the gate the rest of the tick uses — an `error` does not fire
+			// `pause`, so a failure mid-playback leaves `paused` false.
+			if (recoveringRef.current) {
+				return;
 			}
 			const activeSourceId = videoSourcesRef.current[sourceIndexRef.current]?.id;
 			// Trims only trim ahead during actual playback — scrubbing/paused seeks are
@@ -270,7 +856,14 @@ export function VirtualPreview({
 			// in a separate rAF effect). Cheap; <video>.readyState >= 2 guards
 			// against drawing a black frame into the cursor overlay.
 			if (v.readyState >= 2) {
-				setSourceTimeSec(v.currentTime);
+				// One read, three uses: `currentTime` is a live accessor into the
+				// media pipeline and this block runs 60×/s.
+				const sourceTime = v.currentTime;
+				setSourceTimeSec(sourceTime);
+				// Sampled here, where the decoder is known good, because this is
+				// where a reload has to put the playhead back if it cannot
+				// resolve one from the timeline.
+				lastGoodSourceTimeRef.current = sourceTime;
 			}
 			// À L'ARRÊT, le `<video>` ne pilote PLUS la position de la timeline.
 			//
@@ -419,6 +1012,39 @@ export function VirtualPreview({
 		frame.style.transform = `translate(${transform.translateXPercent}%, ${transform.translateYPercent}%) scale(${transform.scale})`;
 	}, [zoomRegions, virtualTimeSec]);
 
+	/**
+	 * Write a source position onto the element with AT MOST ONE demuxer seek in
+	 * flight; a target that arrives while one is running replaces the queue and
+	 * is applied on `seeked`. Latest wins — an intermediate scrub position is
+	 * never a destination the user asked to see.
+	 *
+	 * This is the root cause of #395, not a mitigation of it. Dragging the
+	 * playhead makes V4Timeline publish a new time every rAF (it already
+	 * coalesces pointermove to that, "to avoid IPC flooding"), the shell mints a
+	 * seekTarget per publish, and this component turned each one into a
+	 * `currentTime` write: ~60 demuxer seeks a second on a 1080p H.264 file that
+	 * the native compositor is decoding at the same time. Chromium eventually
+	 * fails one — `PIPELINE_ERROR_READ: FFmpegDemuxer: demuxer seek failed`,
+	 * reproduced on a file ffmpeg decodes end to end without a single defect —
+	 * and before this branch, any media error emptied the editor.
+	 */
+	const applySourceTime = useCallback((video: HTMLVideoElement, sourceTimeSec: number) => {
+		if (!Number.isFinite(sourceTimeSec)) return;
+		if (Math.abs(video.currentTime - sourceTimeSec) <= 0.01) {
+			pendingScrubTargetRef.current = null;
+			return;
+		}
+		if (video.seeking) {
+			pendingScrubTargetRef.current = sourceTimeSec;
+			return;
+		}
+		pendingScrubTargetRef.current = null;
+		// Flagged at the moment of the ACTUAL write: a deferred target must not
+		// have its flag consumed by a frame on which no seek happened.
+		isProgrammaticSeekRef.current = true;
+		video.currentTime = sourceTimeSec;
+	}, []);
+
 	const seekToVirtualTime = useCallback(
 		(nextVirtualTimeSec: number, preservePlayback = false, forceResume = false) => {
 			const position = locateVirtualPosition(clips, nextVirtualTimeSec);
@@ -466,11 +1092,20 @@ export function VirtualPreview({
 			const video = videoRef.current;
 			if (!video) return;
 
-			isProgrammaticSeekRef.current = true;
-			updateVirtualTime(position.virtualTimeSec);
-			if (Math.abs(video.currentTime - position.sourceTimeSec) > 0.01) {
-				video.currentTime = position.sourceTimeSec;
+			if (pendingSeekRef.current) {
+				// A load is in flight (a reload, or a source that has just been
+				// swapped in), so the seek below is a no-op — assigning
+				// `currentTime` before metadata only sets the default playback
+				// start position, and `onLoadedMetadata` is about to apply the
+				// queued resume over the top of it. Re-aim that resume instead:
+				// it is older intent than the gesture the user just made.
+				pendingSeekRef.current = {
+					sourceTimeSec: position.sourceTimeSec,
+					play: shouldContinuePlayback,
+				};
 			}
+			updateVirtualTime(position.virtualTimeSec);
+			applySourceTime(video, position.sourceTimeSec);
 			if (shouldContinuePlayback) {
 				// A rejection here means playback never actually started, so the browser
 				// never fired 'play' — nothing to reconcile, just avoid an unhandled
@@ -480,17 +1115,126 @@ export function VirtualPreview({
 				});
 			}
 		},
-		[clips, videoSources, sourceIndex, updateVirtualTime],
+		[applySourceTime, clips, videoSources, sourceIndex, updateVirtualTime],
 	);
 
-	const seekToSourceTime = useCallback((sourceTimeSec: number) => {
-		const video = videoRef.current;
-		if (!video) return;
-		isProgrammaticSeekRef.current = true;
-		if (Math.abs(video.currentTime - sourceTimeSec) > 0.01) {
-			video.currentTime = sourceTimeSec;
+	const seekToSourceTime = useCallback(
+		(sourceTimeSec: number) => {
+			const video = videoRef.current;
+			if (!video) return;
+			// A load is in flight, so this write would be a no-op that
+			// `onLoadedMetadata` then overwrites — re-aim the queued resume instead.
+			if (pendingSeekRef.current) {
+				pendingSeekRef.current = { sourceTimeSec, play: pendingSeekRef.current.play };
+				return;
+			}
+			applySourceTime(video, sourceTimeSec);
+		},
+		[applySourceTime],
+	);
+
+	/**
+	 * Re-run the media load algorithm on the mounted element after a delay, and
+	 * queue the position to come back to. Everything is read through refs, so the
+	 * callback is stable and the scheduled work always sees current state.
+	 */
+	const reloadActiveSource = useCallback((play: boolean, delayMs: number) => {
+		if (retryTimerRef.current !== null) {
+			window.clearTimeout(retryTimerRef.current);
+			retryTimerRef.current = null;
 		}
+		recoveringRef.current = true;
+		setLoadState("loading");
+		retryTimerRef.current = window.setTimeout(() => {
+			retryTimerRef.current = null;
+			const video = videoRef.current;
+			if (!video) return;
+			// Resolved HERE rather than when the error fired: the user can scrub
+			// during the backoff, and the position they left the playhead on is
+			// the one that has to come back. An asset switch queued in the
+			// meantime is newer intent still, so it wins outright.
+			if (!pendingSeekRef.current) {
+				const position = locateVirtualPosition(clipsRef.current, virtualTimeSecRef.current);
+				// `locateVirtualPosition` answers for whatever clip the playhead
+				// is on, which after a boundary advance can belong to a DIFFERENT
+				// asset — its source time would be a meaningless offset into the
+				// file we are about to reload. The mounted source is read from the
+				// same two mirrors the rAF tick uses, rather than kept in a third.
+				const clipIsOnThisSource =
+					position?.clip.assetId === videoSourcesRef.current[sourceIndexRef.current]?.id;
+				if (position && clipIsOnThisSource) {
+					// The rAF resumes against this; leaving it stale would resolve
+					// the next tick against the clip we were on before the failure.
+					activeClipIdRef.current = position.clip.id;
+				}
+				const resumeSec =
+					position && clipIsOnThisSource ? position.sourceTimeSec : lastGoodSourceTimeRef.current;
+				pendingSeekRef.current = {
+					sourceTimeSec: Number.isFinite(resumeSec) ? resumeSec : 0,
+					play,
+				};
+			}
+			// The restore itself rides the cross-asset path `onLoadedMetadata`
+			// already implements — one resume path in this component, not two.
+			//
+			// load() and nothing else: per spec it unconditionally re-runs the
+			// media load algorithm. Re-assigning `src` first (the obvious
+			// alternative) starts a SECOND load that aborts the first, which
+			// surfaces as a spurious MEDIA_ERR_ABORTED.
+			video.load();
+		}, delayMs);
 	}, []);
+
+	/** The element is loaded again, so the reload is over and any failure the
+	 *  caller is showing can go. Note what this does NOT do: re-arm the retry
+	 *  budget. `loadedmetadata`/`canplay` prove the container header parsed and
+	 *  the decoder is willing — not that the bytes that killed us are readable.
+	 *  A truncated recording (intact header, unreadable data — the case the error
+	 *  card exists for) re-fires both on every reload, so re-arming here would
+	 *  hand back the budget faster than failures could spend it: a 400 ms reload
+	 *  loop, forever, with nothing ever shown to the user. Getting PAST the
+	 *  failure point is the only honest evidence, and the rAF tick below owns it. */
+	const markSourceLoaded = useCallback(() => {
+		recoveringRef.current = false;
+		const id = videoSourcesRef.current[sourceIndexRef.current]?.id;
+		if (id) onVideoRecovered?.(id);
+	}, [onVideoRecovered]);
+
+	// Reload bookkeeping belongs to the MOUNTED MEDIA, so it is keyed on the URL
+	// as well as the asset id — the element is keyed on the id alone (see the
+	// <video> below), so re-pointing an asset at a different file re-runs the
+	// load algorithm on the SAME element, and a budget spent on the old file
+	// must not be charged to the new one. Nothing re-points an asset today; the
+	// relink this card's copy invites would be the first, and it is the exact
+	// case where a fresh budget is the whole point.
+	// The cleanup matters for the swap that IS reachable: a reload scheduled for
+	// the old element must never fire against its replacement. React runs it
+	// before any queued macrotask can.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run when the mounted media changes
+	useEffect(() => {
+		reloadsRef.current = [];
+		gaveUpRef.current = false;
+		recoveringRef.current = false;
+		return () => {
+			if (retryTimerRef.current !== null) {
+				window.clearTimeout(retryTimerRef.current);
+				retryTimerRef.current = null;
+			}
+		};
+	}, [activeSourceKey, activeSource?.src]);
+
+	// The caller's Retry button. Same path as an automatic reload so the two
+	// cannot drift, but with a fresh budget and no delay: the user clicked
+	// because they know something changed.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the token bump IS the request
+	useEffect(() => {
+		if (!retryToken) return;
+		// Deliberately does NOT record a reload: the user's click must not spend
+		// one of the recoveries it is meant to restore.
+		reloadsRef.current = [];
+		gaveUpRef.current = false;
+		reloadActiveSource(false, 0);
+	}, [retryToken]);
 
 	// BUG corrigé : cet effet listait `seekToVirtualTime`/`seekToSourceTime` en dépendances
 	// — mais `seekToVirtualTime` change d'identité (nouveau `useCallback`) à chaque fois que
@@ -518,7 +1262,10 @@ export function VirtualPreview({
 	}, [seekTarget]);
 
 	return (
-		<div className={styles.container}>
+		// The load state no longer paints anything here (Preview owns failure UI
+		// now), but it is still the honest read of what the decode clock is doing —
+		// worth one attribute for tests and for a screenshot in a bug report.
+		<div className={styles.container} data-load-state={loadState}>
 			{activeSource ? (
 				<>
 					<div ref={videoFrameRef} className={styles.videoFrame}>
@@ -539,9 +1286,11 @@ export function VirtualPreview({
 								cursor: settings.cursorShow ? "none" : undefined,
 							}}
 							preload="metadata"
+							muted
 							playsInline
 							onLoadedMetadata={(e) => {
 								setLoadState("ready");
+								markSourceLoaded();
 								// ponytail: forward the raw duration (possibly NaN for
 								// MediaRecorder WebMs) to the parent. handleLoadedMetadata
 								// falls back to a 60s seed when it isn't finite so the
@@ -575,20 +1324,85 @@ export function VirtualPreview({
 									seekToVirtualTime(virtualTimeSec);
 								}
 							}}
+							onSeeked={(e) => {
+								// The demuxer is free again: apply the newest target that
+								// arrived while it was busy, if the playhead has moved on.
+								const queued = pendingScrubTargetRef.current;
+								if (queued !== null) {
+									pendingScrubTargetRef.current = null;
+									applySourceTime(e.currentTarget, queued);
+								}
+							}}
 							onWaiting={() => setLoadState("loading")}
-							onCanPlay={() => setLoadState("ready")}
+							onCanPlay={() => {
+								setLoadState("ready");
+								markSourceLoaded();
+							}}
 							onError={(e) => {
+								const el = e.currentTarget;
+								const description = describeMediaError(el.error);
+								// An element whose source was torn out from under it reports a
+								// "load failure" that says nothing about the media (Chromium
+								// calls it "Empty src attribute"). Never act on that.
+								const hasSource = Boolean(el.getAttribute("src")) || Boolean(el.currentSrc);
+								const nowMs = Date.now();
+								reloadsRef.current = pruneReloads(reloadsRef.current, nowMs);
+								const reloadsInWindow = reloadsRef.current.length;
+								const disposition = hasSource
+									? mediaErrorDisposition(description.code, reloadsInWindow, gaveUpRef.current)
+									: "ignore";
+								const detail = formatMediaError(description);
+								// The code is the whole diagnosis, and it used to be thrown
+								// away — which is why issue #395 could only ever be reported
+								// as "the preview disappeared". Keep it, whatever we decide.
+								const context = {
+									assetId: activeSource.id,
+									src: activeSource.src,
+									detail,
+									networkState: el.networkState,
+									readyState: el.readyState,
+									currentTime: el.currentTime,
+									reloadsInWindow,
+									gaveUp: gaveUpRef.current,
+									disposition,
+								};
+								if (disposition === "ignore") {
+									// Routine: every cross-asset clip boundary remounts this
+									// element mid-load. `debug`, not `warn` — this fires during
+									// ordinary playback and must not read as a problem.
+									console.debug(
+										"[preview] ignoring a <video> error from a cancelled load",
+										context,
+									);
+									return;
+								}
+								if (disposition === "retry") {
+									console.warn("[preview] <video> failed, reloading", context);
+									reloadsRef.current.push(nowMs);
+									// Deliberately no pause(): a 400 ms reload should be a blip
+									// the user never sees, and pausing here would flip the
+									// shell's transport for it. What keeps the rAF from
+									// steering the dead decoder in the meantime is
+									// `recoveringRef`, set by reloadActiveSource.
+									reloadActiveSource(!el.paused, retryDelayMs(reloadsInWindow));
+									return;
+								}
 								// ponytail: don't blindly advance to the next source — if
 								// the failed source owns the current virtual clip, the
 								// next sourceIndex will seekToVirtualTime right back into
 								// the same failed asset, looping. Fail the preview.
+								console.error("[preview] <video> failed for good", context);
 								pendingSeekRef.current = null;
+								recoveringRef.current = false;
+								// Latched so an expiring window cannot restart the cycle behind
+								// the card. Only Retry or a media change lifts it.
+								gaveUpRef.current = true;
 								setLoadState("error");
 								// An 'error' doesn't itself fire 'pause', so make sure the shell's
 								// transport state (single source of truth, see NewEditorShell's
 								// own play/pause/ended listener) actually learns playback stopped.
-								e.currentTarget.pause();
-								onVideoError?.(activeSource.id);
+								el.pause();
+								onVideoError?.(activeSource.id, detail);
 							}}
 							onEnded={() => {
 								// BUG corrigé : ce handler stoppait TOUJOURS la lecture dès que le
@@ -626,14 +1440,49 @@ export function VirtualPreview({
 							// handles clip-end advancement, so dropping the event
 							// handler here is safe.
 						/>
-						{/* Plus d'overlay « Loading preview… » : il reflétait l'état du <video>
-						    CACHÉ (source horloge/audio), pas la preview RÉELLE — le canvas natif,
-						    qui montre déjà une image valide pendant que le <video> re-seek. Il
-						    recouvrait donc une bonne image à chaque scrub, pour rien. On garde
-						    seulement l'erreur, qui, elle, signale un vrai échec de chargement. */}
-						{loadState === "error" && (
-							<div className={styles.overlay}>Video preview could not be loaded.</div>
-						)}
+						<audio
+							key={`${activeSource.id}:primary-audio`}
+							ref={setPrimaryAudioElement}
+							src={activeSource.src}
+							preload="metadata"
+							aria-hidden="true"
+							data-testid="preview-audio-primary"
+						/>
+						{supplementalAudioSrc ? (
+							<audio
+								key={`${activeSource.id}:supplemental-audio`}
+								ref={setSupplementalAudioElement}
+								src={supplementalAudioSrc}
+								preload="metadata"
+								aria-hidden="true"
+								data-testid="preview-audio-supplemental"
+							/>
+						) : null}
+						{/* Imported audio tracks (issue #350). One element per track, kept in
+						    sync by the rAF loop above via audioTrackElsRef. A track whose asset
+						    URL isn't resolved yet is skipped rather than mounted src-less. */}
+						{audioTracks.map((track) => {
+							const src = audioSources.find((s) => s.id === track.assetId)?.src;
+							if (!src) return null;
+							return (
+								<audio
+									key={`audio-track:${track.id}`}
+									ref={(element) => registerAudioTrackEl(track.id, element)}
+									src={src}
+									preload="metadata"
+									aria-hidden="true"
+									data-testid={`preview-audio-track-${track.id}`}
+								/>
+							);
+						})}
+						{/* Plus d'overlay ici du tout. « Loading preview… » reflétait l'état du
+						    <video> CACHÉ (source horloge/audio), pas la preview RÉELLE — le canvas
+						    natif, qui montre déjà une image valide pendant que le <video> re-seek.
+						    L'overlay d'erreur, lui, est parti chez Preview (#395) : il vivait dans
+						    .videoFrame, sur lequel l'effet de zoom écrit `style.transform`, donc à
+						    3× il partait hors cadre ; il n'était pas traduit ; et surtout il ne
+						    proposait rien — l'échec est désormais une carte avec un bouton
+						    Réessayer, rendue au-dessus de la dernière image composée. */}
 					</div>
 					{/* The native D3D canvas already draws the recorded-cursor sprite as part
 					    of the composited frame (same cursor sidecar file, single source of

@@ -97,6 +97,12 @@ pub enum Event {
         asset_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         asset: Option<CursorAsset>,
+        /// `"click"` on the sample that coincides with a left-button press read
+        /// from evdev (see `input.rs`), absent otherwise. Omitted rather than
+        /// defaulted to `"move"` so the accumulator keeps that fallback in one
+        /// place and the wire stays quiet on the common case.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction_type: Option<String>,
     },
     /// Which capture node each audio source was linked to.
     ///
@@ -143,8 +149,9 @@ pub enum Event {
         timestamp_ms: u64,
         path: String,
         duration_ms: u64,
-        /// Frames written to the file, including any duplicated to hold the
-        /// constant frame rate.
+        /// Frames actually encoded. Output is variable-rate (each frame stamped
+        /// with its wall-clock PTS), so under drops this can be FEWER than
+        /// `duration_ms * fps` — a stall is one held frame spanning many slots.
         frames: u64,
         /// Frames the compositor delivered that the encoder never saw, because a
         /// newer one replaced them in the mailbox first. A non-zero value here
@@ -303,12 +310,32 @@ mod tests {
             visible: true,
             asset_id: None,
             asset: None,
+            interaction_type: None,
         });
         assert_eq!(value["event"], "cursor-sample");
         assert_eq!(value["x"], 100);
         assert_eq!(value["visible"], true);
         assert!(value.get("assetId").is_none());
         assert!(value.get("asset").is_none());
+        // A plain move stays silent about its interaction so the accumulator's
+        // "move" default is the single source of that word.
+        assert!(value.get("interactionType").is_none());
+    }
+
+    #[test]
+    fn cursor_samples_report_a_click_when_tagged() {
+        let value = parse_one(&Event::CursorSample {
+            timestamp_ms: 12,
+            x: 100,
+            y: 200,
+            width: 1920,
+            height: 1080,
+            visible: true,
+            asset_id: None,
+            asset: None,
+            interaction_type: Some("click".to_owned()),
+        });
+        assert_eq!(value["interactionType"], "click");
     }
 
     #[test]
@@ -329,6 +356,7 @@ mod tests {
                 hotspot_x: 4,
                 hotspot_y: 3,
             }),
+            interaction_type: None,
         });
         assert_eq!(value["assetId"], "abc");
         assert_eq!(value["asset"]["imageDataUrl"], "data:image/png;base64,AA==");
@@ -359,6 +387,7 @@ mod tests {
             visible: true,
             asset_id: None,
             asset: None,
+            interaction_type: None,
         });
         assert_eq!(value["timestampMs"], 1234, "a sample's capture time must not be overwritten");
     }

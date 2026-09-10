@@ -3,6 +3,7 @@ import { useScopedT } from "@/contexts/I18nContext";
 import { noteUiProbeClipSwitch } from "@/lib/ai-edition/perf/uiFrameProbe";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
+import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
 import { resolveNativePosition } from "@/lib/ai-edition/timeline/timelineMap";
 import {
 	pushAllNativeParams,
@@ -80,6 +81,17 @@ export function NativeCompositorOverlay() {
 
 	// `null` = document pas encore chargé (on attend) ; `{}` = chargé sans asset (→ fixture) ;
 	// `{screenPath,…}` = vraies sources de l'asset primaire.
+	const settings = useMemo(() => getEditorSettings(document), [document]);
+
+	// The real camera path, independent of whether NATIVE is the one drawing it: the scene
+	// still needs it to look up the probed webcam size, which shapes the PiP box.
+	const cameraPath = useMemo(() => {
+		if (!document) return undefined;
+		const primary =
+			document.assets.find((a) => a.id === document.project.primaryAssetId) ?? document.assets[0];
+		return primary ? assetCameraSource(primary).path || undefined : undefined;
+	}, [document]);
+
 	const sources = useMemo(() => {
 		if (!document) {
 			return null;
@@ -89,12 +101,12 @@ export function NativeCompositorOverlay() {
 		if (!primary?.originalPath) {
 			return {};
 		}
+		// `undefined` rather than `""` here ONLY because `useNativeCompositorView`
+		// treats the key's absence as "no webcam source"; the value still comes from
+		// the one accessor, so it can never disagree with the scene or the export.
 		return {
 			screenPath: primary.originalPath,
-			webcamPath:
-				primary.cameraTrack?.visible && primary.cameraTrack.sourcePath
-					? primary.cameraTrack.sourcePath
-					: undefined,
+			webcamPath: assetCameraSource(primary).path || undefined,
 			// sidecar convention (electron/ipc/handlers.ts readCursorRecordingFile) : la
 			// télémétrie curseur vit à côté de la vidéo tant qu'elle n'a pas bougé. Absente →
 			// le natif ignore juste le curseur (CursorTrack::load échoue silencieusement).
@@ -131,8 +143,7 @@ export function NativeCompositorOverlay() {
 			return;
 		}
 		try {
-			const activeWebcamPath = sources && "webcamPath" in sources ? sources.webcamPath : undefined;
-			const webcamSourceSize = activeWebcamPath ? getWebcamNativeSize(activeWebcamPath) : null;
+			const webcamSourceSize = cameraPath ? getWebcamNativeSize(cameraPath) : null;
 			const scene = buildSceneDescription(document, webcamSourceSize);
 			setNativeScene(JSON.stringify(scene));
 		} catch (error) {
@@ -163,7 +174,6 @@ export function NativeCompositorOverlay() {
 	// n'a pas d'importance. Et ca ne peut pas lutter contre un drag de slider :
 	// `setLive` passe par `setDocument`, donc `document` a deja la NOUVELLE
 	// valeur a chaque tick -- la meme que celle que le handler vient de pousser.
-	const settings = useMemo(() => getEditorSettings(document), [document]);
 	useEffect(() => {
 		const push = () => pushAllNativeParams(settings);
 		push();
@@ -196,8 +206,7 @@ export function NativeCompositorOverlay() {
 		if (!asset?.originalPath) {
 			return;
 		}
-		const cam = asset.cameraTrack;
-		const webcamPath = cam && cam.visible && cam.sourcePath ? cam.sourcePath : "";
+		const camera = assetCameraSource(asset);
 		const targetClipId = activeClipId;
 		// Sonde de fluidité (diagnostic) : sépare les mesures d'avant et d'après un
 		// franchissement de clip, qui se sont déjà révélées non comparables.
@@ -214,8 +223,8 @@ export function NativeCompositorOverlay() {
 		setActiveClip(
 			viewId,
 			asset.originalPath,
-			webcamPath,
-			cam ? (cam.startMs + cam.offsetMs) / 1000 : 0,
+			camera.path,
+			camera.offsetSec,
 			activeClipIndex,
 			activeSourceTimeSec,
 		)

@@ -6,8 +6,6 @@
 		"cancelRecording": "إلغاء التسجيل",
 		"pauseRecording": "إيقاف التسجيل مؤقتاً",
 		"resumeRecording": "استئناف التسجيل",
-		"openVideoFile": "فتح ملف فيديو",
-		"openProject": "فتح مشروع",
 		"useVerticalTray": "استخدام الشريط العمودي",
 		"useHorizontalTray": "استخدام الشريط الأفقي",
 		"openStudio": "فتح الاستوديو",
@@ -80,6 +78,11 @@
 		"useEditableCursor": "استخدام مؤشر قابل للتحرير",
 		"useSystemCursor": "استخدام مؤشر النظام"
 	},
+	"autoZoom": {
+		"enable": "تفعيل التكبير التلقائي بعد التسجيل",
+		"disable": "تعطيل التكبير التلقائي بعد التسجيل",
+		"needsEditableCursor": "التكبير التلقائي يحتاج إلى المؤشر القابل للتحرير. بدّل وضع المؤشر للتفعيل."
+	},
 	"softwareEncoderFallback": {
 		"title": "تم التبديل إلى الترميز البرمجي",
 		"description": "تعذّر تشغيل مرمّز GPU الافتراضي، لذا تحوّل OpenScreen إلى ترميز H.264 البرمجي. سيستمر التسجيل كالمعتاد، لكن استخدام المعالج قد يكون أعلى.",
@@ -93,6 +96,9 @@
 		"micHint": "تحدّث لاختبار الميكروفون",
 		"noMicrophones": "لم يتم العثور على ميكروفون",
 		"preview": "معاينة",
-		"previewUnavailable": "المعاينة غير متاحة"
+		"previewUnavailable": "المعاينة غير متاحة",
+		"about": "حول",
+		"version": "الإصدار {{version}}",
+		"checkingForUpdates": "جارٍ التحقق…"
 	}
 }

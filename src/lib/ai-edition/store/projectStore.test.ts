@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useProjectStore } from "./projectStore";
+import { saveWithDeadline, useProjectStore, waitForDocumentSaves } from "./projectStore";
+import { clearHistory, past, pushHistory } from "./undoStack";
 
 const bridgeMocks = vi.hoisted(() => ({
 	get: vi.fn(),
@@ -13,6 +14,17 @@ const bridgeMocks = vi.hoisted(() => ({
 
 const toastMocks = vi.hoisted(() => ({
 	error: vi.fn(),
+}));
+
+// Stub only the audio duration probe (issue #350): mounting a real <audio> in
+// jsdom never fires loadedmetadata, so an unmocked probe would block on its
+// timeout. Everything else in the module (probeVideoDimensions) stays real so
+// the video-import tests above are untouched.
+const durationMocks = vi.hoisted(() => ({ probeAudioDuration: vi.fn() }));
+
+vi.mock("../timeline/duration", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../timeline/duration")>()),
+	probeAudioDuration: durationMocks.probeAudioDuration,
 }));
 
 vi.mock("@/native/client", () => ({
@@ -61,6 +73,7 @@ const sampleDoc = {
 	},
 	annotations: [],
 	zoomRanges: [],
+	audioTracks: [],
 	legacyEditor: null,
 };
 
@@ -71,6 +84,7 @@ describe("useProjectStore", () => {
 			mock.mockReset();
 		}
 		toastMocks.error.mockReset();
+		durationMocks.probeAudioDuration.mockReset();
 		// biome-ignore lint/suspicious/noExplicitAny: test-only stub of the legacy contextBridge surface
 		(window as any).electronAPI = { findRecordingCamera: vi.fn() };
 	});
@@ -297,6 +311,205 @@ describe("useProjectStore", () => {
 		expect(toastMocks.error.mock.calls[0][0]).toContain("video.mp4");
 	});
 
+	// Issue #350 — external audio import.
+	it("addAudioAsset passes kind 'audio', skips the camera lookup, and returns the asset", async () => {
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: sampleDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		durationMocks.probeAudioDuration.mockResolvedValue(null);
+		const audioDoc = {
+			...sampleDoc,
+			assets: [
+				{ id: "audio_asset", kind: "audio", label: "voiceover.mp3", originalPath: "/tmp/vo.mp3" },
+			],
+		};
+		bridgeMocks.addAsset.mockResolvedValue({ assetId: "audio_asset", document: audioDoc });
+
+		const asset = await useProjectStore.getState().addAudioAsset("/tmp/vo.mp3");
+
+		expect(asset?.id).toBe("audio_asset");
+		expect(asset?.kind).toBe("audio");
+		// The bridge must be told this is an audio import (4th arg).
+		expect(bridgeMocks.addAsset).toHaveBeenCalledWith(
+			"proj_test",
+			"/tmp/vo.mp3",
+			undefined,
+			"audio",
+		);
+		// Audio has no camera sidecar — the lookup that addAsset does must not run.
+		expect(vi.mocked(window.electronAPI.findRecordingCamera)).not.toHaveBeenCalled();
+		// Probe returned null, so nothing to stamp: no extra save.
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+	});
+
+	it("addAudioAsset stamps the probed duration onto the asset", async () => {
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: sampleDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		durationMocks.probeAudioDuration.mockResolvedValue(8.25);
+		const audioDoc = {
+			...sampleDoc,
+			assets: [
+				{ id: "audio_asset", kind: "audio", label: "bgm.wav", originalPath: "/tmp/bgm.wav" },
+			],
+		};
+		bridgeMocks.addAsset.mockResolvedValue({ assetId: "audio_asset", document: audioDoc });
+		bridgeMocks.save.mockImplementation((document: unknown) =>
+			Promise.resolve({ success: true, document }),
+		);
+
+		const asset = await useProjectStore.getState().addAudioAsset("/tmp/bgm.wav");
+
+		expect(asset?.durationSec).toBe(8.25);
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(useProjectStore.getState().document?.assets[0]?.durationSec).toBe(8.25);
+	});
+
+	// Placement + selection for imported audio tracks (issue #350).
+	const audioAsset = {
+		id: "audio_1",
+		kind: "audio" as const,
+		label: "voiceover.mp3",
+		originalPath: "/tmp/vo.mp3",
+		durationSec: 12,
+		cameraTrack: null,
+	};
+
+	it("addAudioTrack places a track at the playhead for an audio asset and selects it", async () => {
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: { ...sampleDoc, assets: [audioAsset] },
+			revision: 1,
+			status: "ready",
+			error: null,
+			currentTimeSec: 5,
+		});
+		bridgeMocks.save.mockImplementation((document: unknown) =>
+			Promise.resolve({ success: true, document }),
+		);
+
+		const id = await useProjectStore.getState().addAudioTrack("audio_1");
+
+		const tracks = useProjectStore.getState().document?.audioTracks ?? [];
+		expect(tracks).toHaveLength(1);
+		// Head at the playhead (5s), in raw ruler ms.
+		expect(tracks[0]).toMatchObject({ assetId: "audio_1", startMs: 5000, durationSec: 12 });
+		expect(id).toBe(tracks[0]?.id);
+		// Placing a track selects it so the inspector opens on its controls.
+		expect(useProjectStore.getState().selectedAudioTrackId).toBe(id);
+	});
+
+	it("addAudioTrack refuses a non-audio (or unknown) asset and selects nothing", async () => {
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: sampleDoc, // its only asset, if any, is not audio
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		expect(await useProjectStore.getState().addAudioTrack("nope")).toBeNull();
+		expect(useProjectStore.getState().selectedAudioTrackId).toBeNull();
+	});
+
+	it("importAudioAsset adds the asset then places and selects a track in one action", async () => {
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: sampleDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+			currentTimeSec: 0,
+		});
+		durationMocks.probeAudioDuration.mockResolvedValue(12);
+		bridgeMocks.addAsset.mockResolvedValue({
+			assetId: "audio_1",
+			document: { ...sampleDoc, assets: [audioAsset] },
+		});
+		bridgeMocks.save.mockImplementation((document: unknown) =>
+			Promise.resolve({ success: true, document }),
+		);
+
+		const asset = await useProjectStore.getState().importAudioAsset("/tmp/vo.mp3");
+
+		expect(asset?.id).toBe("audio_1");
+		const tracks = useProjectStore.getState().document?.audioTracks ?? [];
+		expect(tracks).toHaveLength(1);
+		expect(tracks[0]?.assetId).toBe("audio_1");
+		expect(useProjectStore.getState().selectedAudioTrackId).toBe(tracks[0]?.id);
+	});
+
+	it("clear() resets the audio-track selection", () => {
+		useProjectStore.setState({ selectedAudioTrackId: "audio_x" });
+		useProjectStore.getState().clear();
+		expect(useProjectStore.getState().selectedAudioTrackId).toBeNull();
+	});
+
+	// The save boundary. Every write in the app funnels through `saveDocument`, and
+	// almost every caller `void`s it from a click handler, so what this function does
+	// with a failure IS what the user sees.
+	describe("saveDocument reports a failed write instead of rejecting", () => {
+		it("resolves false, tells the user, and leaves the document alone", async () => {
+			useProjectStore.setState({
+				projectId: "proj_test",
+				document: sampleDoc,
+				revision: 3,
+				status: "ready",
+				dirty: true,
+			});
+			bridgeMocks.save.mockResolvedValue({ success: false, error: "EACCES" });
+
+			const edited = { ...sampleDoc, project: { ...sampleDoc.project, title: "Edited" } };
+			await expect(
+				useProjectStore.getState().saveDocument(edited, { history: true }),
+			).resolves.toBe(false);
+
+			expect(toastMocks.error).toHaveBeenCalledWith("Failed to save project", {
+				description: "EACCES",
+			});
+			const state = useProjectStore.getState();
+			expect(state.document?.project.title).toBe("Test");
+			expect(state.revision).toBe(3);
+			// Still dirty: `dirty` is the only input to the beforeunload guard and to
+			// `setHasUnsavedChanges`, so a failed write is the last moment to claim clean.
+			expect(state.dirty).toBe(true);
+		});
+
+		it("never rejects, so a detached caller cannot leak an unhandled rejection", async () => {
+			useProjectStore.setState({ projectId: "proj_test", document: sampleDoc, dirty: true });
+			bridgeMocks.save.mockRejectedValue(new Error("bridge is gone"));
+
+			await expect(
+				useProjectStore.getState().saveDocument(sampleDoc, { history: true }),
+			).resolves.toBe(false);
+			expect(toastMocks.error).toHaveBeenCalledWith("Failed to save project", {
+				description: "bridge is gone",
+			});
+		});
+
+		it("resolves true and commits on success", async () => {
+			const saved = { ...sampleDoc, project: { ...sampleDoc.project, title: "Saved" } };
+			useProjectStore.setState({ projectId: "proj_test", document: sampleDoc, dirty: true });
+			bridgeMocks.save.mockResolvedValue({ success: true, document: saved });
+
+			await expect(useProjectStore.getState().saveDocument(saved, { history: true })).resolves.toBe(
+				true,
+			);
+
+			expect(toastMocks.error).not.toHaveBeenCalled();
+			const state = useProjectStore.getState();
+			expect(state.document?.project.title).toBe("Saved");
+			expect(state.dirty).toBe(false);
+		});
+	});
+
 	it("removeAsset requires a loaded project", async () => {
 		await expect(useProjectStore.getState().removeAsset("asset_x")).rejects.toThrow(
 			"No project loaded",
@@ -318,6 +531,172 @@ describe("useProjectStore", () => {
 			revision: 0,
 			status: "idle",
 			error: null,
+		});
+	});
+
+	it("clear drops the undo history with the project", () => {
+		// Explicit rather than leaning on the `beforeEach`, which reaches this same code.
+		clearHistory();
+		useProjectStore.setState({ projectId: "proj_test", document: sampleDoc });
+		pushHistory({ projectId: "proj_test", doc: sampleDoc });
+		expect(past).toHaveLength(1);
+
+		useProjectStore.getState().clear();
+
+		// Hygiene rather than a restore hazard -- `undo` refuses a snapshot whose
+		// projectId does not match, and there is no projectId left to match. What the
+		// stack was actually holding is up to fifty cloned documents, kept alive until
+		// the next project load.
+		expect(past).toHaveLength(0);
+	});
+
+	it("clear supersedes a save that was already in flight", async () => {
+		// `clear()`'s one production caller deletes the open project. A background save
+		// issued a moment earlier -- a transcript, a duration probe -- used to resolve
+		// after it and reinstall the deleted project's document over the empty state,
+		// with `dirty: false` and a fresh `lastSavedAt` claiming it was on disk.
+		const renamed = { ...sampleDoc, project: { ...sampleDoc.project, title: "Renamed" } };
+		clearHistory();
+		useProjectStore.setState({ projectId: "proj_test", document: sampleDoc, dirty: true });
+		let release: (() => void) | undefined;
+		bridgeMocks.save.mockReturnValue(
+			new Promise((resolve) => {
+				release = () => resolve({ success: true, document: renamed });
+			}),
+		);
+
+		const inFlight = useProjectStore.getState().saveDocument(renamed, { history: true });
+		useProjectStore.getState().clear();
+		release?.();
+
+		await expect(inFlight).resolves.toBe(false);
+		expect(useProjectStore.getState().document).toBeNull();
+		expect(useProjectStore.getState().dirty).toBe(false);
+		// And nothing recorded either: the write that would have pushed the pre-rename
+		// document is the one being dropped.
+		expect(past).toHaveLength(0);
+	});
+	describe("addAsset drops work the user has already moved on from", () => {
+		// `addAsset` awaits the native add, a camera lookup, a dimension probe and a save,
+		// and then writes the store unconditionally. Anything the user does in those gaps
+		// -- deleting the open project, switching to another one -- used to lose to the
+		// write that landed last.
+		function pendingAdd() {
+			let release!: (value: { document: typeof sampleDoc }) => void;
+			bridgeMocks.addAsset.mockReturnValue(
+				new Promise((resolve) => {
+					release = resolve;
+				}),
+			);
+			return { release };
+		}
+
+		beforeEach(() => {
+			// biome-ignore lint/suspicious/noExplicitAny: test-only stub of the legacy contextBridge surface
+			(window as any).electronAPI = {
+				findRecordingCamera: vi.fn().mockResolvedValue({ success: false }),
+			};
+		});
+
+		it("does not reinstall a deleted project's document", async () => {
+			bridgeMocks.create.mockResolvedValue({ success: true, document: sampleDoc });
+			await useProjectStore.getState().createProject("Test");
+
+			const { release } = pendingAdd();
+			const pending = useProjectStore.getState().addAsset("C:/clip.mp4");
+
+			// The user deletes the project while the add is still in flight.
+			useProjectStore.getState().clear();
+			release({ document: sampleDoc });
+
+			await expect(pending).resolves.toBeNull();
+			expect(useProjectStore.getState().document).toBeNull();
+			expect(useProjectStore.getState().projectId).toBeNull();
+		});
+
+		it("does not drop one project's asset into the project the user switched to", async () => {
+			bridgeMocks.create.mockResolvedValue({ success: true, document: sampleDoc });
+			await useProjectStore.getState().createProject("Test");
+
+			const { release } = pendingAdd();
+			const pending = useProjectStore.getState().addAsset("C:/clip.mp4");
+
+			const other = {
+				...sampleDoc,
+				project: { ...sampleDoc.project, id: "proj_other", title: "Other" },
+			};
+			bridgeMocks.get.mockResolvedValue({ success: true, document: other });
+			await useProjectStore.getState().loadProject("proj_other");
+
+			release({ document: sampleDoc });
+
+			await expect(pending).resolves.toBeNull();
+			// Still the project the user chose, not the one the add was building on.
+			expect(useProjectStore.getState().projectId).toBe("proj_other");
+			expect(useProjectStore.getState().document?.project.id).toBe("proj_other");
+		});
+	});
+
+	// The other half of the deadline. `waitForDocumentSaves` is for a caller queued
+	// BEHIND a save; this is for the one that started it, whose own `await` is what
+	// a chain or a queue gets sequenced on. Plain promises rather than the store, so
+	// nothing here leaves the in-flight counter raised.
+	describe("saveWithDeadline", () => {
+		it("passes the save's own answer through", async () => {
+			await expect(saveWithDeadline(Promise.resolve(true), 5_000)).resolves.toBe(true);
+			await expect(saveWithDeadline(Promise.resolve(false), 5_000)).resolves.toBe(false);
+		});
+
+		it("gives up on a save that never settles", async () => {
+			await expect(saveWithDeadline(new Promise(() => undefined), 10)).resolves.toBe("timeout");
+		});
+
+		it("clears the deadline once the save answers", async () => {
+			vi.useFakeTimers();
+			try {
+				await expect(saveWithDeadline(Promise.resolve(true), 10_000)).resolves.toBe(true);
+				expect(vi.getTimerCount()).toBe(0);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	// `saveDocument` releases waiters from a `finally`, so a save that REJECTS is
+	// already covered. A bridge call that never settles at all runs no `finally`:
+	// without a deadline the in-flight counter stays above zero and every waiter
+	// parks for the life of the renderer, wedging the fresh-recording auto-zoom
+	// chain behind it. The stuck case is deliberately last in this file — its save
+	// never resolves, so it leaves the counter raised for anything after it.
+	describe("waitForDocumentSaves", () => {
+		it("resolves idle immediately when nothing is in flight", async () => {
+			await expect(waitForDocumentSaves(5_000)).resolves.toBe("idle");
+		});
+
+		it("resolves idle once an in-flight save settles", async () => {
+			useProjectStore.setState({ projectId: "proj_test", document: sampleDoc, dirty: true });
+			let release!: () => void;
+			bridgeMocks.save.mockReturnValue(
+				new Promise((resolve) => {
+					release = () => resolve({ success: true, document: sampleDoc });
+				}),
+			);
+			const inFlight = useProjectStore.getState().saveDocument(sampleDoc, { history: false });
+			const wait = waitForDocumentSaves(5_000);
+			release();
+			await inFlight;
+			await expect(wait).resolves.toBe("idle");
+		});
+
+		it("gives up with a timeout when a save never settles", async () => {
+			useProjectStore.setState({ projectId: "proj_test", document: sampleDoc, dirty: true });
+			bridgeMocks.save.mockReturnValue(new Promise(() => undefined));
+			void useProjectStore.getState().saveDocument(sampleDoc, { history: false });
+
+			await expect(waitForDocumentSaves(10)).resolves.toBe("timeout");
+			// A timed-out waiter takes itself out of the queue, so the next caller gets
+			// its own deadline rather than inheriting a stale resolver.
+			await expect(waitForDocumentSaves(10)).resolves.toBe("timeout");
 		});
 	});
 });

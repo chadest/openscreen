@@ -1,9 +1,8 @@
 import {
-	Captions as CaptionsIcon,
+	AudioLines,
+	Camera,
 	ChevronRight,
 	FileText,
-	Image as ImageIcon,
-	Layout as LayoutIcon,
 	Maximize2,
 	MousePointer2,
 	Pencil,
@@ -14,7 +13,7 @@ import {
 	ZoomIn,
 } from "lucide-react";
 import type { ComponentProps } from "react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { parseCustomPlaybackSpeedInput } from "@/components/video-editor/customPlaybackSpeed";
 import {
@@ -39,10 +38,10 @@ import { useEditorSettings } from "@/lib/ai-edition/store/useEditorSettings";
 import type { useTimeline } from "@/lib/ai-edition/store/useTimeline";
 import { formatSeconds } from "@/lib/ai-edition/timeline/format";
 import { coalescedTrimGroups } from "@/lib/ai-edition/timeline/trim-mapping";
-import { CaptionsPane } from "../CaptionsPane";
 import { ColorField } from "../ColorField";
 import {
-	BackgroundPane,
+	AudioPane,
+	AudioTrackPane,
 	CursorPane,
 	LayoutPane,
 	SliderCell,
@@ -54,14 +53,19 @@ import styles from "./EditorShellV4.module.css";
 
 type TimelineApi = ReturnType<typeof useTimeline>;
 
-export type Facet = "background" | "effects" | "layout" | "cursor" | "captions" | "transcript";
+// No "captions" facet: caption settings are a popover on the transcript tab now.
+// They were never a separate concern from the transcript — they RENDER it — and two
+// tabs meant two entry points to transcription, one of which ("transcribe video",
+// on the caption tab) was the only one many users ever found. See issue #560.
+export type Facet = "effects" | "layout" | "audio" | "cursor" | "transcript";
 
-const FACETS: Array<{ id: Facet; labelKey: string; icon: typeof ImageIcon }> = [
-	{ id: "background", labelKey: "background.title", icon: ImageIcon },
+const FACETS: Array<{ id: Facet; labelKey: string; icon: typeof SlidersHorizontal }> = [
+	// Background is a SECTION of this facet now, not a facet of its own — see
+	// VideoEffectsPane for why the split had nowhere to sit.
 	{ id: "effects", labelKey: "effects.title", icon: SlidersHorizontal },
-	{ id: "layout", labelKey: "layout.title", icon: LayoutIcon },
+	{ id: "layout", labelKey: "layout.title", icon: Camera },
+	{ id: "audio", labelKey: "audio.title", icon: AudioLines },
 	{ id: "cursor", labelKey: "cursor.title", icon: MousePointer2 },
-	{ id: "captions", labelKey: "facets.captions", icon: CaptionsIcon },
 	{ id: "transcript", labelKey: "facets.transcript", icon: FileText },
 ];
 
@@ -99,14 +103,30 @@ export function FloatingInspector({
 	const ts = useScopedT("settings");
 	const te = useScopedT("editor");
 	const [clipPickerOpen, setClipPickerOpen] = useState(false);
+	const clipPickerRef = useRef<HTMLDivElement | null>(null);
+	useEffect(() => {
+		if (!clipPickerOpen) return;
+		const onDocMouseDown = (e: MouseEvent) => {
+			if (clipPickerRef.current && !clipPickerRef.current.contains(e.target as Node)) {
+				setClipPickerOpen(false);
+			}
+		};
+		document.addEventListener("mousedown", onDocMouseDown);
+		return () => document.removeEventListener("mousedown", onDocMouseDown);
+	}, [clipPickerOpen]);
 	const selection = tl.selection;
-	const effectiveOpen = open || selection !== null;
+	// An imported audio track is selected (issue #350) — like a region selection it
+	// takes over the inspector body with its own pane (see AudioTrackPane).
+	const audioTrackSelected = Boolean(tl.selectedAudioTrackId);
+	const effectiveOpen = open || selection !== null || audioTrackSelected;
 	return (
 		<div className={styles.inspectorWrap}>
 			{effectiveOpen ? (
 				<div className={styles.inspector}>
 					{selection ? (
 						<SelectionPane tl={tl} onClose={() => tl.clearSelection()} />
+					) : audioTrackSelected ? (
+						<AudioTrackPane tl={tl} onClose={() => tl.clearSelection()} />
 					) : (
 						<FacetBody facet={facet} onCollapse={onToggleOpen} transcriptProps={transcriptProps} />
 					)}
@@ -119,11 +139,11 @@ export function FloatingInspector({
 						type="button"
 						title={ts(labelKey)}
 						aria-label={ts(labelKey)}
-						aria-pressed={!selection && open && facet === id}
+						aria-pressed={!selection && !audioTrackSelected && open && facet === id}
 						onClick={() => {
 							// Switching facets while an element is selected should show
 							// the facet, not leave the selection pane on top of it.
-							if (selection) tl.clearSelection();
+							if (selection || audioTrackSelected) tl.clearSelection();
 							if (facet === id && open) {
 								onToggleOpen();
 							} else {
@@ -134,7 +154,7 @@ export function FloatingInspector({
 						<Icon size={17} />
 					</button>
 				))}
-				<div style={{ position: "relative" }}>
+				<div ref={clipPickerRef} style={{ position: "relative" }}>
 					<button
 						type="button"
 						title={te("editClipDialog.title")}
@@ -252,19 +272,13 @@ function paneHeader(icon: React.ReactNode, title: string, onClose: () => void, c
 			</h2>
 			<button
 				type="button"
+				className={styles.iconBtn}
 				title={closeLabel}
 				aria-label={closeLabel}
 				onClick={onClose}
 				style={{
-					width: 26,
-					height: 26,
-					display: "grid",
-					placeItems: "center",
-					borderRadius: 8,
-					color: "var(--muted)",
-					background: "transparent",
-					border: 0,
-					cursor: "pointer",
+					width: 28,
+					height: 28,
 				}}
 			>
 				<X size={15} />
@@ -1052,12 +1066,14 @@ function FacetBody({
 		</button>
 	);
 
-	if (facet === "background") return wrap(collapse, <BackgroundPane />);
-	if (facet === "effects") return wrap(collapse, <VideoEffectsPane />);
 	if (facet === "layout") return wrap(collapse, <LayoutPane />);
+	if (facet === "audio") return wrap(collapse, <AudioPane />);
 	if (facet === "cursor") return wrap(collapse, <CursorPane />);
 	if (facet === "transcript") return wrap(collapse, <TranscriptPane {...transcriptProps} />);
-	return wrap(collapse, <CaptionsPane />);
+	// `effects` is the fallthrough rather than a branch of its own: the union has no
+	// tail left now that captions is a popover, and a `never` check here would only
+	// restate what the type already says.
+	return wrap(collapse, <VideoEffectsPane />);
 }
 
 function wrap(collapse: React.ReactNode, body: React.ReactNode) {

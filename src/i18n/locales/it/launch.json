@@ -6,8 +6,6 @@
 		"cancelRecording": "Annulla registrazione",
 		"pauseRecording": "Metti in pausa registrazione",
 		"resumeRecording": "Riprendi registrazione",
-		"openVideoFile": "Apri file video",
-		"openProject": "Apri progetto",
 		"useVerticalTray": "Usa barra verticale",
 		"useHorizontalTray": "Usa barra orizzontale",
 		"openStudio": "Apri Studio",
@@ -58,6 +56,11 @@
 		"useEditableCursor": "Usa cursore modificabile",
 		"useSystemCursor": "Usa cursore di sistema"
 	},
+	"autoZoom": {
+		"enable": "Attiva lo zoom automatico dopo la registrazione",
+		"disable": "Disattiva lo zoom automatico dopo la registrazione",
+		"needsEditableCursor": "Lo zoom automatico richiede il cursore modificabile. Cambia la modalità del cursore per attivarlo."
+	},
 	"sourceSelector": {
 		"loading": "Caricamento sorgenti...",
 		"screens": "Schermi ({{count}})",
@@ -93,6 +96,9 @@
 		"micHint": "Parla per testare il microfono",
 		"noMicrophones": "Nessun microfono trovato",
 		"preview": "Anteprima",
-		"previewUnavailable": "Anteprima non disponibile"
+		"previewUnavailable": "Anteprima non disponibile",
+		"about": "Info",
+		"version": "Versione {{version}}",
+		"checkingForUpdates": "Controllo…"
 	}
 }

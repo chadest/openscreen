@@ -7,8 +7,21 @@ import {
 import { ZOOM_DEPTH_SCALES } from "../../src/lib/ai-edition/timeline/zoom-scale";
 import { executeAgentTool, isMutatingTool, MUTATING_TOOL_NAMES } from "./agent-tools";
 
+/** ponytail: every fixture in this file starts from the SAME instant.
+ *  `createEmptyDocument` reads the wall clock when a caller hands it no
+ *  `createdAt`, so two documents built by two calls carry different
+ *  `createdAt`/`updatedAt` whenever the calls straddle a millisecond — and any
+ *  assertion that compares two of them is a coin flip on a loaded runner. That
+ *  already failed a PR touching none of this code. No test here reads the value,
+ *  so pinning it costs nothing and makes every document in the file comparable. */
+const FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
+
 function fixtureDocument(): AxcutDocument {
-	const base = createEmptyDocument({ title: "Test", projectId: "proj_1" });
+	const base = createEmptyDocument({
+		title: "Test",
+		projectId: "proj_1",
+		createdAt: FIXTURE_CREATED_AT,
+	});
 	return documentSchema.parse({
 		...base,
 		project: { ...base.project, primaryAssetId: "asset_1" },
@@ -75,7 +88,11 @@ function fixtureDocument(): AxcutDocument {
 /** One clip whose end is NOT a round number — the real recording length that
  * made the clamp visible (24.703979 s of source, stored as 24 704 ms). */
 function shortSingleClip(): AxcutDocument {
-	const base = createEmptyDocument({ title: "Short", projectId: "proj_short" });
+	const base = createEmptyDocument({
+		title: "Short",
+		projectId: "proj_short",
+		createdAt: FIXTURE_CREATED_AT,
+	});
 	return documentSchema.parse({
 		...base,
 		project: { ...base.project, primaryAssetId: "asset_1" },
@@ -155,6 +172,7 @@ describe("the mutating-tool table", () => {
 		expect([...MUTATING_TOOL_NAMES].sort()).toEqual(
 			[
 				"addAnnotation",
+				"addAudio",
 				"addCameraFullscreen",
 				"addSpeed",
 				"addTrim",
@@ -167,10 +185,12 @@ describe("the mutating-tool table", () => {
 				"removeTrim",
 				"replaceTimeline",
 				"setAnnotation",
+				"setAudio",
 				"setCameraFullscreen",
 				"setClipRange",
 				"setSpeed",
 				"setTrim",
+				"setWordText",
 				"setZoom",
 			].sort(),
 		);
@@ -1133,7 +1153,11 @@ describe("replaceTimeline refuses what it would destroy", () => {
 	/** The workbench's `twoClipsWithTrim`: clips placed by the AGENT, which is
 	 *  exactly what the old `origin === "user"` guard could not see. */
 	function twoAgentClipsWithTrim(): AxcutDocument {
-		const base = createEmptyDocument({ title: "Two clips", projectId: "proj_two" });
+		const base = createEmptyDocument({
+			title: "Two clips",
+			projectId: "proj_two",
+			createdAt: FIXTURE_CREATED_AT,
+		});
 		return documentSchema.parse({
 			...base,
 			project: { ...base.project, primaryAssetId: "asset_1" },
@@ -1267,7 +1291,11 @@ describe("replaceTimeline refuses what it would destroy", () => {
 
 describe("moveClip — the tool the prompt used to promise", () => {
 	function twoClips(): AxcutDocument {
-		const base = createEmptyDocument({ title: "Two clips", projectId: "proj_move" });
+		const base = createEmptyDocument({
+			title: "Two clips",
+			projectId: "proj_move",
+			createdAt: FIXTURE_CREATED_AT,
+		});
 		return documentSchema.parse({
 			...base,
 			project: { ...base.project, primaryAssetId: "asset_1" },
@@ -1638,5 +1666,715 @@ describe("getCursorTrack", () => {
 		expect(result.document).toBeUndefined();
 		expect(JSON.parse(result.resultJson).available).toBe(true);
 		expect(isMutatingTool("getCursorTrack")).toBe(false);
+	});
+});
+
+// ─── D-ANCHOR: a zoom's focus is something a result can be held to ──────────
+//
+// `focus` was the one argument of a zoom write that no result ever mentioned. A
+// span covering no clip is refused, a depth off the table is refused, and the
+// span that actually landed is reported — but a focus ON the pointer and a focus
+// half a frame away from it produced byte-identical results, so nothing
+// downstream could tell the two apart. These tests hold both halves: the
+// measurement is present and correct where the runtime can make it, and ABSENT
+// everywhere it would be a claim the runtime has no standing to make.
+
+/** A pointer parked at one place over a source window, sampled at 10 Hz — the
+ *  shape a zoom's focus is usually aimed at, and the one whose spread is 0 so a
+ *  test can assert the reported position exactly. */
+function parkedSamples(fromSec: number, toSec: number, cx: number, cy: number) {
+	const out: Array<{ timeMs: number; cx: number; cy: number }> = [];
+	for (let ms = Math.round(fromSec * 1000); ms <= Math.round(toSec * 1000); ms += 100) {
+		out.push({ timeMs: ms, cx, cy });
+	}
+	return out;
+}
+
+function withTrack(
+	samples: Array<{ timeMs: number; cx: number; cy: number }>,
+	assetId = "asset_1",
+) {
+	return { cursorTelemetry: { load: { status: "ok" as const, assetId, samples } } };
+}
+
+/** Two recordings, laid back to back. Their clips cover DIFFERENT ruler spans
+ *  from IDENTICAL source windows, which is what makes reading one asset's track
+ *  as if it described the other silently plausible. */
+function twoAssetDocument(): AxcutDocument {
+	const base = createEmptyDocument({
+		title: "Two",
+		projectId: "proj_two",
+		createdAt: FIXTURE_CREATED_AT,
+	});
+	return documentSchema.parse({
+		...base,
+		project: { ...base.project, primaryAssetId: "asset_1" },
+		assets: [
+			{ id: "asset_1", kind: "video", label: "Screen", originalPath: "C:/a.mp4", durationSec: 10 },
+			{ id: "asset_2", kind: "video", label: "B-roll", originalPath: "C:/b.mp4", durationSec: 10 },
+		],
+		timeline: {
+			...base.timeline,
+			clips: [
+				{
+					id: "clip_a",
+					assetId: "asset_1",
+					sourceStartSec: 0,
+					sourceEndSec: 10,
+					timelineStartSec: 0,
+					timelineEndSec: 10,
+					wordRefs: [],
+					origin: "user",
+					reason: "",
+				},
+				{
+					id: "clip_b",
+					assetId: "asset_2",
+					sourceStartSec: 0,
+					sourceEndSec: 10,
+					timelineStartSec: 10,
+					timelineEndSec: 20,
+					wordRefs: [],
+					origin: "user",
+					reason: "",
+				},
+			],
+		},
+	});
+}
+
+/** Zoom ids are fresh uuids, so two runs of the same write differ in the one
+ *  place that carries no meaning. Everything else must match byte for byte. */
+function withoutIds(document: AxcutDocument | undefined): string {
+	return JSON.stringify(document).replace(/zoom_[0-9a-f-]+/g, "zoom_x");
+}
+
+describe("addZoom answers for the focus it was given", () => {
+	it("reports where the pointer really was, beside the focus it received", () => {
+		// The samples outside the span are the other half of the assertion: a
+		// report that averaged the whole track would land nowhere near (0.8, 0.7).
+		const samples = [...parkedSamples(2, 6, 0.8, 0.7), ...parkedSamples(20, 25, 0.1, 0.2)];
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 2, endSec: 6, focus: { cx: 0.2, cy: 0.1 } }),
+			withTrack(samples),
+		);
+		const anchor = JSON.parse(result.resultJson).cursorAnchor;
+
+		expect(result.ok).toBe(true);
+		expect(anchor.available).toBe(true);
+		expect(anchor.focus).toEqual({ cx: 0.2, cy: 0.1 });
+		expect(anchor.cursor).toEqual({ cx: 0.8, cy: 0.7 });
+		expect(anchor.offset).toBeCloseTo(Math.hypot(0.6, 0.6), 3);
+		// A parked pointer has nowhere to stray: `spread` is what tells a reader
+		// whether the single position above stands for anything.
+		expect(anchor.spread).toBe(0);
+		expect(anchor.samples).toBe(41);
+	});
+
+	it("echoes the default focus a call never set", () => {
+		// The case a caller cannot reconstruct from its own arguments: it sent no
+		// focus, so it has no record that it asked for the centre of the frame.
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 2, endSec: 6 }),
+			withTrack(parkedSamples(2, 6, 0.8, 0.7)),
+		);
+		const anchor = JSON.parse(result.resultJson).cursorAnchor;
+
+		expect(anchor.focus).toEqual({ cx: 0.5, cy: 0.5 });
+		expect(anchor.cursor).not.toEqual(anchor.focus);
+	});
+
+	it("reports; it does not place — the document is identical either way", () => {
+		// THE invariant. This is a reporting change: a zoom written by a runtime
+		// that can read telemetry and one written by a runtime that cannot must be
+		// the same zoom, in the same place, described to the user the same way.
+		const args = JSON.stringify({ startSec: 2, endSec: 6, focus: { cx: 0.2, cy: 0.1 } });
+		// ponytail: ONE base for both runs. The invariant is about the same document
+		// written by two runtimes, and comparing the outputs of two separate
+		// `fixtureDocument()` calls was never that claim. (The wall-clock stamps that
+		// made the two-call form flake are pinned at `FIXTURE_CREATED_AT` now — the
+		// argument for one base is the invariant, not the flake.)
+		const base = fixtureDocument();
+		const blind = executeAgentTool(base, "addZoom", args);
+		const seeing = executeAgentTool(
+			base,
+			"addZoom",
+			args,
+			withTrack(parkedSamples(2, 6, 0.8, 0.7)),
+		);
+
+		expect(withoutIds(seeing.document)).toEqual(withoutIds(blind.document));
+		expect(seeing.summary).toEqual(blind.summary);
+		// …and the ONLY difference is in the report.
+		expect(seeing.resultJson).toContain("cursorAnchor");
+		expect(blind.resultJson).not.toContain("cursorAnchor");
+	});
+
+	it("measures the span that LANDED, not the span that was asked for", () => {
+		// CLAMP. `addZoom {20,40}` on a 24.70 s clip stores 20–24.704. Measuring the
+		// requested window would let 152 samples the zoom never covers outvote the
+		// 48 it does, and answer (0.1, 0.1) for a pointer that sat at (0.9, 0.9)
+		// throughout the zoom.
+		const samples = [...parkedSamples(20, 24.7, 0.9, 0.9), ...parkedSamples(24.8, 40, 0.1, 0.1)];
+		const result = executeAgentTool(
+			shortSingleClip(),
+			"addZoom",
+			JSON.stringify({ startSec: 20, endSec: 40 }),
+			withTrack(samples),
+		);
+		const payload = JSON.parse(result.resultJson);
+
+		expect(payload.clamped).toBe(true);
+		expect(payload.cursorAnchor.cursor).toEqual({ cx: 0.9, cy: 0.9 });
+		expect(payload.cursorAnchor.samples).toBe(48);
+	});
+
+	it("spans every fragment when a zoom is split across two clips", () => {
+		// FRAGMENTATION. Two fragments, two source windows, one answer: reporting
+		// only the first would describe half the zoom and say nothing about it.
+		const samples = [
+			...parkedSamples(25, 29.9, 0.7, 0.3),
+			...parkedSamples(30, 35, 0.7, 0.3),
+			...parkedSamples(36, 40, 0.1, 0.9),
+		];
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 25, endSec: 35 }),
+			withTrack(samples),
+		);
+		const payload = JSON.parse(result.resultJson);
+
+		expect(payload.fragments).toBe(2);
+		// 50 from the first fragment and 51 from the second: the first alone would
+		// be 50, and the decoy after the zoom ends would drag the position off
+		// (0.7, 0.3) if the window were the ruler span rather than the anchors.
+		expect(payload.cursorAnchor.samples).toBe(101);
+		expect(payload.cursorAnchor.cursor).toEqual({ cx: 0.7, cy: 0.3 });
+	});
+
+	it("has no window to report on when nothing was placed", () => {
+		// NOTHING PLACED. The span covers no clip, so the write is refused and
+		// there is no landed window to measure — the refusal must not grow a
+		// measurement of a zoom that does not exist.
+		const telemetry = withTrack(parkedSamples(0, 30, 0.8, 0.7));
+		const nowhere = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 90, endSec: 95 }),
+			telemetry,
+		);
+		expect(nowhere.ok).toBe(false);
+		expect(nowhere.resultJson).toContain("covers no clip");
+		expect(nowhere.resultJson).not.toContain("cursorAnchor");
+
+		// Same telemetry, a span that does cover a clip: the field is there.
+		const somewhere = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 2, endSec: 6 }),
+			telemetry,
+		);
+		expect(somewhere.resultJson).toContain("cursorAnchor");
+	});
+
+	it("stays silent when the runtime could not look, and never calls that an absence", () => {
+		// Blindness is not evidence. A runtime with no reader wired, and an asset
+		// whose sidecar was checked and is genuinely missing, both leave the field
+		// OFF — an absent field claims nothing, while a present one saying "no
+		// cursor here" would put our limit into the answer as their fact.
+		const args = JSON.stringify({ startSec: 2, endSec: 6 });
+		const blind = [
+			undefined,
+			{ cursorTelemetry: {} },
+			{ cursorTelemetry: { load: { status: "unavailable" as const, assetId: "asset_1" } } },
+			{ cursorTelemetry: { load: { status: "no-sidecar" as const, assetId: "asset_1" } } },
+		];
+		for (const options of blind) {
+			const result = executeAgentTool(fixtureDocument(), "addZoom", args, options);
+			expect(result.ok).toBe(true);
+			expect(result.resultJson).not.toContain("cursorAnchor");
+			expect(result.resultJson).not.toMatch(/cursor|pointer|telemetry/i);
+		}
+		// The control: the same call, on a runtime that could read the track.
+		expect(
+			executeAgentTool(fixtureDocument(), "addZoom", args, withTrack(parkedSamples(2, 6, 0.8, 0.7)))
+				.resultJson,
+		).toContain("cursorAnchor");
+	});
+
+	it("says the SPAN carries no sample, not that the recording carries none", () => {
+		// The track was read and it simply does not reach here — a finding about
+		// this window, and the note has to keep it that size.
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 20, endSec: 25 }),
+			withTrack(parkedSamples(0, 5, 0.8, 0.7)),
+		);
+		const anchor = JSON.parse(result.resultJson).cursorAnchor;
+
+		expect(anchor.available).toBe(false);
+		expect(anchor.reason).toBe("no-samples");
+		expect(anchor.note).toMatch(/fact about this span/i);
+		expect(anchor.note).not.toMatch(/no cursor data|has no cursor|no pointer data/i);
+
+		// One sample inside the span is enough to turn it into a measurement: the
+		// reason is about coverage, never about the recording.
+		const covered = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 20, endSec: 25 }),
+			withTrack([...parkedSamples(0, 5, 0.8, 0.7), { timeMs: 22_000, cx: 0.4, cy: 0.6 }]),
+		);
+		expect(JSON.parse(covered.resultJson).cursorAnchor).toMatchObject({
+			available: true,
+			cursor: { cx: 0.4, cy: 0.6 },
+			samples: 1,
+		});
+	});
+
+	it("will not read a position off frames a trim cuts out of playback", () => {
+		// The fixture trims source 10–12. Those instants are recorded and never
+		// seen, so a focus argued from them would describe a frame no viewer
+		// reaches — the same untruth as reporting the span that was requested
+		// instead of the one that was stored.
+		const samples = [...parkedSamples(10, 12, 0.9, 0.1), ...parkedSamples(12.1, 14, 0.3, 0.6)];
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 10, endSec: 14 }),
+			withTrack(samples),
+		);
+		const anchor = JSON.parse(result.resultJson).cursorAnchor;
+
+		expect(anchor.cursor).toEqual({ cx: 0.3, cy: 0.6 });
+		expect(anchor.samples).toBe(20);
+
+		// And when the trim takes ALL of them, that is said rather than averaged in.
+		const allCut = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 10, endSec: 12 }),
+			withTrack(parkedSamples(10, 12, 0.9, 0.1)),
+		);
+		expect(JSON.parse(allCut.resultJson).cursorAnchor).toMatchObject({
+			available: false,
+			reason: "trimmed-out",
+		});
+	});
+
+	it("never measures a zoom against another recording's track", () => {
+		// Both clips draw source 0–10 from their own asset, so asset_1's samples
+		// fit asset_2's window arithmetically and would be read as a plausible
+		// answer about footage they do not describe. Silence is the only honest
+		// reply, and it is not a claim that asset_2 has no telemetry.
+		const telemetry = withTrack(parkedSamples(0, 10, 0.8, 0.7), "asset_1");
+		const otherAsset = executeAgentTool(
+			twoAssetDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 12, endSec: 18 }),
+			telemetry,
+		);
+		expect(otherAsset.ok).toBe(true);
+		expect(otherAsset.resultJson).not.toContain("cursorAnchor");
+
+		const ownAsset = executeAgentTool(
+			twoAssetDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 2, endSec: 8 }),
+			telemetry,
+		);
+		expect(JSON.parse(ownAsset.resultJson).cursorAnchor).toMatchObject({
+			available: true,
+			cursor: { cx: 0.8, cy: 0.7 },
+		});
+	});
+
+	it("gives every region of a batch its own answer", () => {
+		const result = executeAgentTool(
+			fixtureDocument(),
+			"addZooms",
+			JSON.stringify({
+				regions: [
+					{ startSec: 2, endSec: 6 },
+					{ startSec: 20, endSec: 24 },
+				],
+			}),
+			withTrack(parkedSamples(2, 6, 0.8, 0.7)),
+		);
+		const applied = JSON.parse(result.resultJson).applied;
+
+		expect(applied[0].cursorAnchor).toMatchObject({
+			available: true,
+			cursor: { cx: 0.8, cy: 0.7 },
+		});
+		// One measured, one not: a batch answer that leaned on the first region
+		// would describe the second with a position taken from somewhere else.
+		expect(applied[1].cursorAnchor).toMatchObject({ available: false, reason: "no-samples" });
+	});
+});
+
+describe("setZoom answers for the focus it kept", () => {
+	function seededZoom(): { document: AxcutDocument; zoomId: string } {
+		const document = executeAgentTool(
+			fixtureDocument(),
+			"addZoom",
+			JSON.stringify({ startSec: 2, endSec: 6, focus: { cx: 0.2, cy: 0.1 } }),
+		).document as AxcutDocument;
+		return { document, zoomId: document.zoomRanges[0].id };
+	}
+
+	it("measures the moved span against the focus the call did not touch", () => {
+		// Reshaping a zoom is mostly a question about where it now points, and the
+		// focus is read back off the document rather than off the arguments —
+		// exactly as `renderedScale` already is.
+		const { document, zoomId } = seededZoom();
+		const result = executeAgentTool(
+			document,
+			"setZoom",
+			JSON.stringify({ zoomId, startSec: 20, endSec: 24 }),
+			withTrack(parkedSamples(20, 24, 0.55, 0.45)),
+		);
+		const anchor = JSON.parse(result.resultJson).cursorAnchor;
+
+		expect(anchor.focus).toEqual({ cx: 0.2, cy: 0.1 });
+		expect(anchor.cursor).toEqual({ cx: 0.55, cy: 0.45 });
+	});
+
+	it("says nothing about the pointer when no track was read", () => {
+		const { document, zoomId } = seededZoom();
+		const result = executeAgentTool(
+			document,
+			"setZoom",
+			JSON.stringify({ zoomId, startSec: 20, endSec: 24 }),
+		);
+		expect(result.ok).toBe(true);
+		expect(result.resultJson).not.toContain("cursorAnchor");
+	});
+});
+
+// Issue #350 / #560 — the audio tools. #561 landed the timeline audio without any
+// agent surface, so these cover both that the model can see it and that it cannot
+// invent an asset to place.
+describe("addAudio / setAudio", () => {
+	/** The fixture plus one imported audio asset. */
+	function withAudioAsset(durationSec: number | null = 30): AxcutDocument {
+		const doc = fixtureDocument();
+		return documentSchema.parse({
+			...doc,
+			assets: [
+				...doc.assets,
+				{
+					id: "audio_1",
+					kind: "audio",
+					label: "bed.mp3",
+					originalPath: "C:/audio/bed.mp3",
+					...(durationSec == null ? {} : { durationSec }),
+				},
+			],
+		});
+	}
+
+	const place = (doc: AxcutDocument, args: Record<string, unknown>) =>
+		executeAgentTool(doc, "addAudio", JSON.stringify(args));
+
+	it("reports imported audio in the snapshot, with the asset kind beside it", () => {
+		// Without `kind` the model sees an asset it cannot explain and tries to place it
+		// as footage; without `audioTracks` it cannot see the lanes at all.
+		const placed = place(withAudioAsset(), {
+			assetId: "audio_1",
+			startSec: 2,
+			endSec: 6,
+			kind: "voiceover",
+		});
+		expect(placed.ok).toBe(true);
+		const snapshot = executeAgentTool(placed.document as AxcutDocument, "getCurrentDocument", "");
+		const parsed = JSON.parse(snapshot.resultJson);
+		expect(parsed.assets.find((a: { id: string }) => a.id === "audio_1").kind).toBe("audio");
+		expect(parsed.audioTracks).toHaveLength(1);
+		expect(parsed.audioTracks[0]).toMatchObject({
+			assetId: "audio_1",
+			kind: "voiceover",
+			startSec: 2,
+			endSec: 6,
+		});
+	});
+
+	it("anchors the placed track to the clip under it", () => {
+		const result = place(withAudioAsset(), { assetId: "audio_1", startSec: 2, endSec: 6 });
+		expect(result.ok).toBe(true);
+		const track = (result.document as AxcutDocument).audioTracks[0];
+		// The anchor is what makes it travel with its clip; a bare startMs/endMs would not.
+		expect(track.clipId).toBe("clip_1");
+		expect(track.origin).toBe("agent");
+	});
+
+	it("plays the whole file when endSec is omitted", () => {
+		const result = place(withAudioAsset(20), { assetId: "audio_1", startSec: 0, offsetSec: 5 });
+		expect(result.ok).toBe(true);
+		const track = (result.document as AxcutDocument).audioTracks[0];
+		// 20s file from an in-point of 5s = 15s of span, so the model never computes it.
+		expect(track.endMs - track.startMs).toBe(15_000);
+	});
+
+	it("refuses an offset at or past the end of a known file", () => {
+		// Otherwise the omitted-end fallback mints a 0.1s track that plays silence, and
+		// the model reports it as having placed audio.
+		const result = place(withAudioAsset(20), { assetId: "audio_1", startSec: 0, offsetSec: 20 });
+		expect(result.ok).toBe(false);
+		expect(result.resultJson).toContain("offsetSec");
+	});
+
+	it("allows any offset while the duration is unknown", () => {
+		// A failed probe leaves no duration; refusing on that would block a legitimate call.
+		expect(place(withAudioAsset(null), { assetId: "audio_1", startSec: 0, offsetSec: 99 }).ok).toBe(
+			true,
+		);
+	});
+
+	it("refuses an unknown asset and names the audio the project actually has", () => {
+		const result = place(withAudioAsset(), { assetId: "nope", startSec: 0, endSec: 4 });
+		expect(result.ok).toBe(false);
+		expect(result.resultJson).toContain("audio_1");
+	});
+
+	it("refuses a video asset, pointing at the tool that does place footage", () => {
+		const result = place(withAudioAsset(), { assetId: "asset_1", startSec: 0, endSec: 4 });
+		expect(result.ok).toBe(false);
+		expect(result.resultJson).toContain("replaceTimeline");
+	});
+
+	it("setAudio re-levels and re-lanes the track it names", () => {
+		const placed = place(withAudioAsset(), { assetId: "audio_1", startSec: 2, endSec: 6 });
+		const id = JSON.parse(placed.resultJson).audioId;
+		const result = executeAgentTool(
+			placed.document as AxcutDocument,
+			"setAudio",
+			JSON.stringify({ audioId: id, gainDb: -6, kind: "voiceover" }),
+		);
+		expect(result.ok).toBe(true);
+		expect((result.document as AxcutDocument).audioTracks[0]).toMatchObject({
+			gainDb: -6,
+			kind: "voiceover",
+		});
+	});
+
+	it("setAudio applies the same offset guard as addAudio", () => {
+		const placed = place(withAudioAsset(20), { assetId: "audio_1", startSec: 2, endSec: 6 });
+		const id = JSON.parse(placed.resultJson).audioId;
+		const result = executeAgentTool(
+			placed.document as AxcutDocument,
+			"setAudio",
+			JSON.stringify({ audioId: id, offsetSec: 25 }),
+		);
+		expect(result.ok).toBe(false);
+	});
+
+	it("removeModifier deletes an audio track by id, like every other kind", () => {
+		const placed = place(withAudioAsset(), { assetId: "audio_1", startSec: 2, endSec: 6 });
+		const id = JSON.parse(placed.resultJson).audioId;
+		const result = executeAgentTool(
+			placed.document as AxcutDocument,
+			"removeModifier",
+			JSON.stringify({ id }),
+		);
+		expect(result.ok).toBe(true);
+		expect((result.document as AxcutDocument).audioTracks).toEqual([]);
+	});
+});
+
+// ─── Correcting a word from the chat ─────────────────────────────
+// The model could READ the transcript and CUT it, and that was all. Asked to fix a
+// misheard name it had exactly one tool that touched a word — addTrim — which removes the
+// audio with it. These two close that: one read that hands out word ids, one write that
+// changes text and nothing else.
+
+/** A transcript with real words, one of them already corrected by the user. */
+function documentWithWords(): AxcutDocument {
+	const base = fixtureDocument();
+	return {
+		...base,
+		transcripts: [
+			{
+				assetId: "asset_1",
+				language: "en",
+				segments: [
+					{
+						id: "seg_1",
+						kind: "speech",
+						startSec: 0,
+						endSec: 3,
+						text: "I use Cuber Nettes",
+						wordIds: ["word_1", "word_2", "word_3"],
+					},
+				],
+				words: [
+					{ id: "word_1", segmentId: "seg_1", startSec: 0, endSec: 1, text: "I" },
+					{ id: "word_2", segmentId: "seg_1", startSec: 1, endSec: 2, text: "use" },
+					{
+						id: "word_3",
+						segmentId: "seg_1",
+						startSec: 2,
+						endSec: 3,
+						text: "Cuber Nettes",
+					},
+				],
+			},
+		],
+	};
+}
+
+function run(document: AxcutDocument, name: string, args: unknown) {
+	return executeAgentTool(document, name, JSON.stringify(args), { editsAllowed: true });
+}
+
+describe("getTranscriptWords", () => {
+	it("hands out the ids setWordText takes", () => {
+		const result = run(documentWithWords(), "getTranscriptWords", {});
+		const payload = JSON.parse(result.resultJson) as {
+			words: Array<{ id: string; text: string }>;
+			total: number;
+		};
+		expect(result.ok).toBe(true);
+		expect(payload.total).toBe(3);
+		expect(payload.words.map((w) => w.id)).toEqual(["word_1", "word_2", "word_3"]);
+	});
+
+	// A half-hour transcript is ~70k tokens. Fixing one name should cost one phrase.
+	it("returns only the words touching the span it is given", () => {
+		const result = run(documentWithWords(), "getTranscriptWords", { startSec: 2, endSec: 3 });
+		const payload = JSON.parse(result.resultJson) as {
+			words: Array<{ id: string }>;
+			total: number;
+		};
+		// Touching counts: `word_2` ends exactly where the span begins. Inclusive on
+		// purpose — a word with no duration at all (one the user typed in) sits on a
+		// single point, and a strict overlap would drop it from every span it meets.
+		expect(payload.words.map((w) => w.id)).toEqual(["word_2", "word_3"]);
+		// `total` still reports the whole transcript, so a filtered read never reads as
+		// the entire thing.
+		expect(payload.total).toBe(3);
+	});
+
+	it("says nothing about provenance for a plainly transcribed word", () => {
+		const result = run(documentWithWords(), "getTranscriptWords", {});
+		const payload = JSON.parse(result.resultJson) as { words: Array<Record<string, unknown>> };
+		expect(payload.words[0]).not.toHaveProperty("source");
+		expect(payload.words[0]).not.toHaveProperty("originalText");
+	});
+
+	it("names what the transcriber had heard, once a word is corrected", () => {
+		const corrected = run(documentWithWords(), "setWordText", {
+			wordId: "word_3",
+			text: "Kubernetes",
+		});
+		const result = run(corrected.document as AxcutDocument, "getTranscriptWords", {});
+		const payload = JSON.parse(result.resultJson) as {
+			words: Array<{ id: string; source?: string; originalText?: string }>;
+		};
+		expect(payload.words.find((w) => w.id === "word_3")).toMatchObject({
+			source: "user",
+			originalText: "Cuber Nettes",
+		});
+	});
+
+	it("refuses an asset with no transcript instead of answering with nothing", () => {
+		const result = run({ ...fixtureDocument(), transcripts: [] }, "getTranscriptWords", {});
+		expect(result.ok).toBe(false);
+		expect(result.resultJson).toContain("No transcript");
+	});
+});
+
+describe("setWordText", () => {
+	it("changes the text and leaves the timeline alone", () => {
+		const before = documentWithWords();
+		const result = run(before, "setWordText", { wordId: "word_3", text: "Kubernetes" });
+		expect(result.ok).toBe(true);
+		const next = result.document as AxcutDocument;
+		expect(next.transcripts[0].words.find((w) => w.id === "word_3")?.text).toBe("Kubernetes");
+		expect(next.timeline).toEqual(before.timeline);
+		expect(next.transcripts[0].segments[0].text).toBe("I use Kubernetes");
+	});
+
+	// The editor gates word INSERTION on a dev-only flag, and that gate lives in the renderer.
+	// The chat runs in the main process, so an ungated path here would let a release rewrite
+	// generated media through the agent — the one door the flag cannot see.
+	it("refuses a word that was added rather than heard", () => {
+		const base = documentWithWords();
+		const withInsertion: AxcutDocument = {
+			...base,
+			transcripts: [
+				...base.transcripts,
+				{
+					assetId: "ext:synth_1",
+					language: "en",
+					segments: [],
+					words: [
+						{
+							id: "synth_1",
+							segmentId: "seg_1",
+							startSec: 0,
+							endSec: 0.15,
+							text: "added",
+							source: "synth",
+						},
+					],
+				},
+			],
+		};
+		const result = run(withInsertion, "setWordText", {
+			assetId: "ext:synth_1",
+			wordId: "synth_1",
+			text: "much longer",
+		});
+		expect(result.ok).toBe(false);
+		expect(result.document).toBeUndefined();
+	});
+
+	// The document carries the transcript twice; a write that reaches only one leaves the
+	// legacy mirror serving the old text forever.
+	it("writes the legacy mirror too", () => {
+		const result = run(documentWithWords(), "setWordText", {
+			wordId: "word_3",
+			text: "Kubernetes",
+		});
+		const next = result.document as AxcutDocument;
+		expect(next.transcript).toBe(next.transcripts.find((t) => t.assetId === "asset_1"));
+	});
+
+	it("empties a word without cutting the speech around it", () => {
+		const result = run(documentWithWords(), "setWordText", { wordId: "word_2", text: "" });
+		const next = result.document as AxcutDocument;
+		expect(next.transcripts[0].words.find((w) => w.id === "word_2")?.text).toBe("");
+		expect(next.transcripts[0].segments[0].text).toBe("I Cuber Nettes");
+		expect(JSON.parse(result.resultJson)).toMatchObject({ blanked: true });
+	});
+
+	it("points an unknown id at the read that hands them out", () => {
+		const result = run(documentWithWords(), "setWordText", { wordId: "seg_1", text: "x" });
+		expect(result.ok).toBe(false);
+		// `seg_1` is a real id — of a SEGMENT. The two namespaces are the trap.
+		expect(result.resultJson).toContain("getTranscriptWords");
+	});
+
+	it("refuses a write that would change nothing", () => {
+		const result = run(documentWithWords(), "setWordText", { wordId: "word_2", text: "use" });
+		expect(result.ok).toBe(false);
+		expect(result.document).toBeUndefined();
+	});
+
+	it("is a consented edit, not a read", () => {
+		const result = executeAgentTool(
+			documentWithWords(),
+			"setWordText",
+			JSON.stringify({ wordId: "word_3", text: "Kubernetes" }),
+			{ editsAllowed: false },
+		);
+		expect(result.document).toBeUndefined();
 	});
 });

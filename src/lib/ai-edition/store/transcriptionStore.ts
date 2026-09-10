@@ -25,12 +25,13 @@
 import { useEffect, useMemo } from "react";
 import { toast } from "sonner";
 import { create } from "zustand";
-import { DEFAULT_LOCALE, LOCALE_STORAGE_KEY, type Locale } from "@/i18n/config";
-import { getAvailableLocales, translate } from "@/i18n/loader";
-import { transcribeAsset, withTranscript } from "../document/transcribe";
+import { toastText as translateToast } from "@/i18n/toastText";
+import { transcribeAsset } from "../document/transcribe";
+import { carryOverWordEdits, withTranscript } from "../document/transcript";
 import type { AxcutDocument } from "../schema";
 import {
 	type AssetTranscriptionView,
+	assetCanCarrySpeech,
 	classifyTranscriptionError,
 	deriveAssetStatus,
 	findAssetTranscript,
@@ -53,6 +54,15 @@ export interface TranscriptionJob {
 	phase?: TranscriptionPhase;
 	/** Chunk progress while transcribing; absent until the first chunk lands. */
 	progress?: TranscriptionProgress;
+	/**
+	 * Which device the engine bound, and how fast it is going. Both arrive with
+	 * the first landed chunk and are refreshed by every chunk after it; both stay
+	 * absent against a helper binary too old to report timing at all.
+	 */
+	backend?: string;
+	rtf?: number;
+	downloadedBytes?: number;
+	totalBytes?: number;
 	/** `"auto"` unless the user forced a language from the media card. */
 	language: string;
 	failure?: TranscriptionFailure;
@@ -85,21 +95,9 @@ function hasLocalSttEngine(): boolean {
 	return typeof window.electronAPI?.stt?.transcribe === "function";
 }
 
-/**
- * Toasts fired outside React still have to speak the user's language. Same
- * source as `I18nProvider` (stored preference, else the default), validated so
- * a stale value can't push `translate` onto a locale it doesn't have.
- */
-function toastText(key: string, vars?: Record<string, string | number>): string {
-	let locale: Locale = DEFAULT_LOCALE;
-	try {
-		const stored = localStorage.getItem(LOCALE_STORAGE_KEY);
-		if (stored && getAvailableLocales().includes(stored as Locale)) locale = stored as Locale;
-	} catch {
-		// localStorage may be unavailable — the default locale is a fine answer.
-	}
-	return translate(locale, "editor", key, vars);
-}
+/** This store's toasts all live in the `editor` namespace. */
+const toastText = (key: string, vars?: Record<string, string | number>) =>
+	translateToast("editor", key, vars);
 
 export const useTranscriptionStore = create<TranscriptionState>((set, get) => ({
 	projectId: null,
@@ -134,6 +132,10 @@ export const useTranscriptionStore = create<TranscriptionState>((set, get) => ({
 				if (jobs[asset.id]) continue;
 				if (findAssetTranscript(document, asset.id)) continue;
 				if (asset.transcriptionFailure) continue;
+				// Music is not speech, and finding that out costs a whole inference pass —
+				// 35s at editor open for a four-minute bed. The manual regenerate in the
+				// media stage stays available for anything this refuses.
+				if (!assetCanCarrySpeech(document, asset.id)) continue;
 				patch()[asset.id] = { status: "queued", language: "auto", manual: false };
 			}
 		}
@@ -321,8 +323,11 @@ async function persistPermanentFailure(
 	const doc = project.document;
 	if (!doc || doc.project.id !== projectId) return;
 	if (!doc.assets.some((a) => a.id === assetId)) return;
-	try {
-		await project.saveDocument({
+	// Best-effort bookkeeping: `saveDocument` reports its own failures and resolves
+	// false rather than throwing, and a note on the asset is not worth a second
+	// message on top of the one the user already got.
+	const persisted = await project.saveDocument(
+		{
 			...doc,
 			assets: doc.assets.map((a) =>
 				a.id === assetId
@@ -336,9 +341,12 @@ async function persistPermanentFailure(
 						}
 					: a,
 			),
-		});
-	} catch (error) {
-		console.warn("[transcription] could not persist the failure on the asset:", error);
+		},
+		// Bookkeeping, not an edit — it must not become an undo step.
+		{ history: false },
+	);
+	if (!persisted) {
+		console.warn("[transcription] could not persist the failure on the asset");
 	}
 }
 
@@ -380,6 +388,16 @@ async function runJob(assetId: string, job: TranscriptionJob): Promise<void> {
 						status.completedSec !== undefined && status.totalSec !== undefined
 							? { completedSec: status.completedSec, totalSec: status.totalSec }
 							: undefined,
+					// Omitted rather than set to undefined when absent: `patchJob` spreads
+					// this object over the job, so a key that is present-but-undefined
+					// would blank out what the last chunk reported. The phases before the
+					// first chunk (audio extraction, the model download) carry neither.
+					...(status.backend !== undefined ? { backend: status.backend } : {}),
+					...(status.rtf !== undefined ? { rtf: status.rtf } : {}),
+					...(status.downloadedBytes !== undefined
+						? { downloadedBytes: status.downloadedBytes }
+						: {}),
+					...(status.totalBytes !== undefined ? { totalBytes: status.totalBytes } : {}),
 				}),
 		});
 		if (controller.signal.aborted) {
@@ -393,8 +411,25 @@ async function runJob(assetId: string, job: TranscriptionJob): Promise<void> {
 			dropJob(assetId, runId);
 			return;
 		}
+		// A run REPLACES the asset's transcript, so any word the user had corrected by
+		// hand would go with it. Carry those corrections onto the new words first —
+		// strictly, so nothing is invented (see `carryOverWordEdits`). What could not be
+		// carried is lost; telling the user so is the UI's job, and there is no surface
+		// for it yet.
+		const merged = carryOverWordEdits(
+			current.transcripts.find((t) => t.assetId === assetId),
+			transcript,
+		);
+		if (merged.dropped > 0) {
+			console.warn(
+				`[transcription] ${merged.dropped} word correction(s) on asset ${assetId} could not be carried over to the new transcript.`,
+			);
+		}
 		// One save: the transcript, and (on a successful retry) the removal of
 		// the verdict remembered on the asset.
+		// `history: false`: a transcript landing from a background job is not an edit
+		// the user made, and making it the target of the next Ctrl+Z would both surprise
+		// them and throw the transcript away.
 		await useProjectStore.getState().saveDocument(
 			withTranscript(
 				{
@@ -403,8 +438,9 @@ async function runJob(assetId: string, job: TranscriptionJob): Promise<void> {
 						a.id === assetId && a.transcriptionFailure ? { ...a, transcriptionFailure: null } : a,
 					),
 				},
-				transcript,
+				merged.transcript,
 			),
+			{ history: false },
 		);
 		dropJob(assetId, runId);
 		if (job.manual) toast.success(toastText("mediaStage.transcriptReady"));
@@ -425,10 +461,14 @@ async function runJob(assetId: string, job: TranscriptionJob): Promise<void> {
 		// instead — the gate then reads "failed" (not "queued forever"), and one
 		// manual retry re-runs them all once the engine is back.
 		if (failure.kind === "error") failRemainingQueue(projectId, failure);
-		// A silent recording is an expected outcome, not an incident: the media
-		// card and every gated button already say so. Only surface the noisy
-		// (retryable) failures, plus anything the user asked for by hand.
-		if (failure.kind === "error" || job.manual) {
+		// A silent recording is an expected outcome, not an incident: the media card
+		// and every gated button already say so, so the background pass stays quiet.
+		// A run the user asked for by hand still gets an answer — but an
+		// informational one, because "this file has no audio" is the answer. Issue
+		// #628 got a red "Transcription failed" quoting ffmpeg's stderr instead.
+		if (isPermanentFailure(failure.kind)) {
+			if (job.manual) toast.info(toastText("mediaStage.noAudioTrackHint"));
+		} else {
 			toast.error(toastText("mediaStage.transcriptionFailed"), { description: failure.message });
 		}
 	} finally {

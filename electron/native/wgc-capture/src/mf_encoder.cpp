@@ -140,7 +140,7 @@ enum class SinkWriterCreateStage {
     SoftwareEncoderRegistration,
     CreateAttributes,
     DisableHardwareTransforms,
-    ConfigureDxgiManager,
+    EnableHardwareTransforms,
     CreateFile,
     CreateFragmentedMediaSink,
     CreateSinkWriter,
@@ -248,10 +248,30 @@ HRESULT createSinkWriter(
             failedStage = SinkWriterCreateStage::DisableHardwareTransforms;
             return hr;
         }
-    } else if (dxgiDeviceManager != nullptr) {
-        HRESULT hr = MFCreateAttributes(&attributes, 3);
+    } else {
+        // Ask for hardware transforms whenever software is not forced --
+        // whether or not a DXGI device manager came with the request.
+        // MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS defaults to FALSE, and
+        // leaving it unset (the old behaviour on the plain CPU-readback path)
+        // meant the sink writer never considered a hardware H.264 MFT even
+        // when one was registered and working: every "default" recording
+        // landed on the same software encoder forceSoftwareEncoder asks for
+        // explicitly, on any machine that had not separately opted into
+        // OPENSCREEN_WGC_ENABLE_DXGI_INPUT (getopenscreen/openscreen#460,
+        // confirmed by videoEncoderRuntime on real hardware: "default" read
+        // back "software" until the DXGI path was turned on, on a machine
+        // whose encoder is hardware-capable either way).
+        //
+        // A hardware MFT does not require the D3D manager to accept samples:
+        // without one it manages its own device and takes system-memory
+        // samples the same way the software encoder does, which is exactly
+        // the CPU-readback path this branch also serves. So the attribute is
+        // set unconditionally here; only the manager itself stays behind the
+        // null check, since supplying a manager the caller does not have would
+        // be undefined rather than merely declined.
+        HRESULT hr = MFCreateAttributes(&attributes, dxgiDeviceManager != nullptr ? 3 : 1);
         if (FAILED(hr)) {
-            std::cerr << "ERROR: MFCreateAttributes(DXGI sink writer) failed (hr=0x"
+            std::cerr << "ERROR: MFCreateAttributes(sink writer) failed (hr=0x"
                       << std::hex << hr << std::dec << ")" << std::endl;
             failedStage = SinkWriterCreateStage::CreateAttributes;
             return hr;
@@ -260,15 +280,17 @@ HRESULT createSinkWriter(
         if (FAILED(hr)) {
             std::cerr << "ERROR: Set MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS(TRUE) failed (hr=0x"
                       << std::hex << hr << std::dec << ")" << std::endl;
-            failedStage = SinkWriterCreateStage::ConfigureDxgiManager;
+            failedStage = SinkWriterCreateStage::EnableHardwareTransforms;
             return hr;
         }
-        hr = attributes->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dxgiDeviceManager);
-        if (FAILED(hr)) {
-            std::cerr << "ERROR: Set MF_SINK_WRITER_D3D_MANAGER failed (hr=0x"
-                      << std::hex << hr << std::dec << ")" << std::endl;
-            failedStage = SinkWriterCreateStage::ConfigureDxgiManager;
-            return hr;
+        if (dxgiDeviceManager != nullptr) {
+            hr = attributes->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dxgiDeviceManager);
+            if (FAILED(hr)) {
+                std::cerr << "ERROR: Set MF_SINK_WRITER_D3D_MANAGER failed (hr=0x"
+                          << std::hex << hr << std::dec << ")" << std::endl;
+                failedStage = SinkWriterCreateStage::EnableHardwareTransforms;
+                return hr;
+            }
         }
     }
 
@@ -382,6 +404,69 @@ bool resolveStreamSinkIndex(IMFMediaSink* mediaSink, const GUID& majorType, DWOR
     return false;
 }
 
+// Did the video stream's encoder MFT actually land on hardware?
+//
+// BeginWriting() succeeding says nothing about this: even on the "default"
+// path (see kVideoEncoderRuntime* in mf_encoder.h), which does now ask for
+// MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, that is a request and not a
+// guarantee -- Media Foundation is still free to hand the sink writer a
+// software MFT when no hardware one is registered or the driver refuses it.
+// The only way to know which one it actually picked is to ask the pipeline it
+// built, after the fact -- IMFSinkWriterEx::GetTransformForStream walks the
+// MFTs the sink writer inserted for a stream, and a hardware MFT instance is
+// required to expose MFT_ENUM_HARDWARE_URL_Attribute on its own attribute
+// store (not just on the IMFActivate MFTEnumEx returns), which is what
+// distinguishes it from a software one at this point.
+//
+// Every failure path here returns "unknown" rather than guessing: this runs
+// after the sink writer is already committed to, so it must never be able to
+// fail configureSinkWriterAttempt, and a wrong hardware/software guess in a
+// bug report would be worse than an admitted "could not tell."
+const char* detectVideoEncoderRuntime(IMFSinkWriter* sinkWriter, DWORD videoStreamIndex) {
+    Microsoft::WRL::ComPtr<IMFSinkWriterEx> sinkWriterEx;
+    if (FAILED(sinkWriter->QueryInterface(IID_PPV_ARGS(&sinkWriterEx)))) {
+        return kVideoEncoderRuntimeUnknown;
+    }
+
+    for (DWORD mftIndex = 0;; mftIndex += 1) {
+        GUID category{};
+        Microsoft::WRL::ComPtr<IMFTransform> transform;
+        const HRESULT hr =
+            sinkWriterEx->GetTransformForStream(videoStreamIndex, mftIndex, &category, &transform);
+        if (hr == MF_E_INVALIDINDEX) {
+            // Walked the whole pipeline (converters, the encoder, anything
+            // else the topology loader inserted) without finding an encoder
+            // node. Should not happen -- an H.264 stream has to have one --
+            // but this is diagnostics code, not the recording path, so an
+            // unexpected shape is "unknown", not a crash.
+            return kVideoEncoderRuntimeUnknown;
+        }
+        if (FAILED(hr)) {
+            return kVideoEncoderRuntimeUnknown;
+        }
+        if (category != MFT_CATEGORY_VIDEO_ENCODER) {
+            // A colour converter or similar the sink writer inserted ahead of
+            // the encoder. Keep walking; the encoder is further down.
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<IMFAttributes> transformAttributes;
+        if (FAILED(transform->GetAttributes(&transformAttributes))) {
+            return kVideoEncoderRuntimeUnknown;
+        }
+        UINT32 hardwareUrlLength = 0;
+        const HRESULT hardwareUrlHr =
+            transformAttributes->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute, &hardwareUrlLength);
+        if (SUCCEEDED(hardwareUrlHr)) {
+            return kVideoEncoderRuntimeHardware;
+        }
+        if (hardwareUrlHr == MF_E_ATTRIBUTENOTFOUND) {
+            return kVideoEncoderRuntimeSoftware;
+        }
+        return kVideoEncoderRuntimeUnknown;
+    }
+}
+
 void logSinkWriterCreateFailure(
     HRESULT sinkWriterHr,
     const char* createCall,
@@ -434,13 +519,15 @@ void setAudioFormat(IMFMediaType* type, UINT32 channels, UINT32 sampleRate, UINT
 // anything is built from it, not after.
 bool buildAacOutputType(
     const AudioInputFormat& audioFormat,
+    bool skipAacRateSnap,
     Microsoft::WRL::ComPtr<IMFMediaType>& outputType) {
     if (audioFormat.sampleRate == 0 || audioFormat.channels == 0 || audioFormat.blockAlign == 0) {
         std::cerr << "ERROR: Invalid audio input format" << std::endl;
         return false;
     }
 
-    const AudioInputFormat encoderFormat = makeAacCompatibleAudioFormat(audioFormat);
+    const AudioInputFormat encoderFormat =
+        skipAacRateSnap ? audioFormat : makeAacCompatibleAudioFormat(audioFormat);
     const UINT32 aacBytesPerSecond = 24'000;
 
     if (!succeeded(MFCreateMediaType(&outputType), "MFCreateMediaType(audio output)")) {
@@ -511,6 +598,10 @@ MFEncoder::~MFEncoder() {
 
 const char* MFEncoder::videoEncoderSelection() const {
     return videoEncoderSelection_;
+}
+
+const char* MFEncoder::videoEncoderRuntime() const {
+    return videoEncoderRuntime_;
 }
 
 const char* MFEncoder::containerFormat() const {
@@ -600,6 +691,7 @@ bool MFEncoder::initialize(
     // encoder, never reaching the software encoder the knob is aimed at.
     useDxgiInput_ = options.useDxgiInput && !options.injectDefaultSinkWriterFailureOnce;
     videoEncoderSelection_ = kVideoEncoderSelectionDefault;
+    videoEncoderRuntime_ = kVideoEncoderRuntimeUnknown;
 
     if (!succeeded(MFStartup(MF_VERSION), "MFStartup")) {
         return false;
@@ -689,6 +781,7 @@ bool MFEncoder::initialize(
         audioStreamIndex_ = 0;
         hasAudioStream_ = false;
         videoEncoderSelection_ = kVideoEncoderSelectionDefault;
+        videoEncoderRuntime_ = kVideoEncoderRuntimeUnknown;
         containerFormat_ = kContainerFormatMp4;
     };
 
@@ -704,7 +797,7 @@ bool MFEncoder::initialize(
         // a construction argument. Null when the recording has no audio, which
         // is both the common case and a documented one for that call.
         Microsoft::WRL::ComPtr<IMFMediaType> audioOutputType;
-        if (audioFormat && !buildAacOutputType(*audioFormat, audioOutputType)) {
+        if (audioFormat && !buildAacOutputType(*audioFormat, options.skipAacRateSnap, audioOutputType)) {
             return false;
         }
 
@@ -768,7 +861,7 @@ bool MFEncoder::initialize(
             }
         }
 
-        if (audioFormat && !configureAudioStream(*audioFormat)) {
+        if (audioFormat && !configureAudioStream(*audioFormat, options)) {
             return false;
         }
 
@@ -780,7 +873,7 @@ bool MFEncoder::initialize(
                        "SetInputMediaType")) {
             return false;
         }
-        if (useDxgiInput_) {
+        if (!forceSoftwareEncoder) {
             applyHardwareRateControl(std::max(1, bitrate));
         }
         if (!succeeded(sinkWriter_->BeginWriting(), "BeginWriting")) {
@@ -788,6 +881,7 @@ bool MFEncoder::initialize(
         }
 
         videoEncoderSelection_ = selection;
+        videoEncoderRuntime_ = detectVideoEncoderRuntime(sinkWriter_.Get(), videoStreamIndex_);
         containerFormat_ = fragmented ? kContainerFormatFragmentedMp4 : kContainerFormatMp4;
         return true;
     };
@@ -854,12 +948,75 @@ bool MFEncoder::initialize(
 // that used to sit between the two -- now happens before the sink writer
 // exists. What is left is the input type, which is the same on both containers
 // and is set on a stream index the caller has already resolved.
-bool MFEncoder::configureAudioStream(const AudioInputFormat& audioFormat) {
+HRESULT probeAacPcmRate(UINT32 sampleRate) {
+    wchar_t dir[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, dir);
+    const std::wstring path = std::wstring(dir) + L"openscreen-wgc-aac-rate-probe-" +
+        std::to_wstring(GetCurrentProcessId()) + L".mp4";
+    DeleteFileW(path.c_str());
+
+    Microsoft::WRL::ComPtr<IMFSinkWriter> writer;
+    HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &writer);
+    if (FAILED(hr)) {
+        DeleteFileW(path.c_str());
+        return hr;
+    }
+
+    Microsoft::WRL::ComPtr<IMFMediaType> outputType;
+    hr = MFCreateMediaType(&outputType);
+    if (FAILED(hr)) {
+        DeleteFileW(path.c_str());
+        return hr;
+    }
+    outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    outputType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+    setAudioFormat(outputType.Get(), 2, sampleRate, 16);
+    outputType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24'000);
+    outputType->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+
+    DWORD streamIndex = 0;
+    hr = writer->AddStream(outputType.Get(), &streamIndex);
+    if (FAILED(hr)) {
+        writer.Reset();
+        DeleteFileW(path.c_str());
+        return hr;
+    }
+
+    Microsoft::WRL::ComPtr<IMFMediaType> inputType;
+    hr = MFCreateMediaType(&inputType);
+    if (FAILED(hr)) {
+        writer.Reset();
+        DeleteFileW(path.c_str());
+        return hr;
+    }
+    inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    inputType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    setAudioFormat(inputType.Get(), 2, sampleRate, 16);
+    inputType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+    inputType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sampleRate * 4);
+    inputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+    hr = writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr);
+    writer.Reset();
+    DeleteFileW(path.c_str());
+    return hr;
+}
+
+bool MFEncoder::configureAudioStream(const AudioInputFormat& audioFormat, const MFEncoderOptions& options) {
     if (!sinkWriter_) {
         return false;
     }
 
-    const AudioInputFormat encoderFormat = makeAacCompatibleAudioFormat(audioFormat);
+    const AudioInputFormat encoderFormat =
+        options.skipAacRateSnap ? audioFormat : makeAacCompatibleAudioFormat(audioFormat);
+
+    if (options.injectAacRateProbe) {
+        const HRESULT probeHr = probeAacPcmRate(encoderFormat.sampleRate);
+        std::cerr << "TEST-ONLY: AAC rate probe sampleRate=" << encoderFormat.sampleRate
+                  << " hr=0x" << std::hex << probeHr << std::dec << std::endl;
+        if (!succeeded(probeHr, "SetInputMediaType(audio)")) {
+            return false;
+        }
+    }
 
     Microsoft::WRL::ComPtr<IMFMediaType> inputType;
     if (!succeeded(MFCreateMediaType(&inputType), "MFCreateMediaType(audio input)")) {
@@ -1204,12 +1361,17 @@ bool MFEncoder::initializeVideoProcessor() {
 }
 
 void MFEncoder::applyHardwareRateControl(int bitrate) {
-    // The D3D manager switches the sink writer onto a hardware MFT, and those
-    // default to constant bitrate: a static desktop then spends the full
-    // configured budget doing nothing, 16.9 Mbps measured against the 1.95 the
-    // software encoder the CPU path lands on produced for the same screen. Same
-    // budget, opposite reading of it. Ask for VBR so the GPU path spends what
-    // the picture costs, which is what users have been getting all along.
+    // Enabling MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS can hand the sink
+    // writer a hardware MFT, and those default to constant bitrate: a static
+    // desktop then spends the full configured budget doing nothing, 16.9 Mbps
+    // measured against the 1.95 the software encoder produced for the same
+    // screen. Same budget, opposite reading of it. Ask for VBR so a hardware
+    // encoder spends what the picture costs, which is what the software
+    // encoder was already doing. Called whenever hardware transforms were
+    // requested, DXGI device manager or not (getopenscreen/openscreen#460) --
+    // whether the sink writer actually landed on hardware is not knowable
+    // until after BeginWriting() (see MFEncoder::videoEncoderRuntime()), and
+    // this call is a no-op on a software MFT that ignores or lacks the knob.
     //
     // Best effort on purpose. An encoder that exposes neither knob still
     // produces a valid recording, and a bitrate we could not pin down is not

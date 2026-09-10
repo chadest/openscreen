@@ -22,8 +22,20 @@ import {
 	splitMergedCaptionsByWordBounds,
 } from "@/lib/captioning/annotationsFromCaptions";
 import type { CaptionSegment } from "@/lib/captioning/transcribe";
-import type { AxcutClip, AxcutDocument, AxcutTranscript } from "../schema";
-import { type CaptionSettings, captionBackgroundCss, captionBandRect } from "./settings";
+import type { AxcutDocument, AxcutTranscript } from "../schema";
+import {
+	lanePlacements,
+	placementRawSec,
+	type TranscriptPlacement,
+} from "../timeline/aggregated-transcript";
+import { removedRawSpans } from "../timeline/programme-time";
+import {
+	type CaptionAnchorV,
+	type CaptionSettings,
+	captionBackgroundCss,
+	captionBoxRect,
+	resolveCaptionLane,
+} from "./settings";
 import { type CaptionTranslations, captionTranslationUnits } from "./translations";
 
 /** One on-screen caption line, in whichever time base the producer documented. */
@@ -151,7 +163,10 @@ export function sourceSpanToTimelineSpans(
 	assetId: string,
 	startSec: number,
 	endSec: number,
-	clips: AxcutClip[],
+	/** Clips, or a voiceover lane's placements — this reads only `assetId`, the source
+	 *  window and the ruler head, which both providers carry (issue #560). `AxcutClip`
+	 *  stays structurally assignable, so every existing caller is unaffected. */
+	clips: TranscriptPlacement[],
 ): Array<{ startSec: number; endSec: number }> {
 	const out: Array<{ startSec: number; endSec: number }> = [];
 	for (const clip of clips) {
@@ -160,11 +175,13 @@ export function sourceSpanToTimelineSpans(
 		const s = Math.max(startSec, clip.sourceStartSec);
 		const e = Math.min(endSec, clipSourceEnd);
 		if (e <= s) continue;
-		out.push({
-			startSec: clip.timelineStartSec + (s - clip.sourceStartSec),
-			endSec: clip.timelineStartSec + (e - clip.sourceStartSec),
-		});
+		// Through `placementRawSec`, never the subtraction it used to write here: a clip
+		// carrying an added word plays its media in pieces, and the seconds after the
+		// insertion sit further along the ruler than their distance from the clip's start.
+		// Writing the short version here is what put every caption after an insertion early.
+		out.push({ startSec: placementRawSec(clip, s), endSec: placementRawSec(clip, e) });
 	}
+	// Onto the ruler the viewer actually sees. Expanding BOTH ends does the whole job:
 	return out;
 }
 
@@ -180,17 +197,29 @@ export function deriveCaptionCues(
 	translations: CaptionTranslations,
 ): CaptionCue[] {
 	if (!document || !settings.enabled) return [];
-	const clips = document.timeline.clips;
-	if (clips.length === 0) return [];
+	// The lane the captions are read FROM — resolved, so a stored "voiceover" whose last
+	// pill has been deleted falls back here rather than exporting nothing (issue #560).
+	const placements = lanePlacements(
+		resolveCaptionLane(document, settings),
+		document.timeline.clips,
+		// `?? []` because the key is additive: a document written before it — or hand-built,
+		// never through the schema — simply has none.
+		document.audioTracks ?? [],
+		removedRawSpans(document.timeline.clips, document.timeline.trimRanges),
+	);
+	if (placements.length === 0) return [];
 
 	const transcripts = new Map(document.transcripts.map((t) => [t.assetId, t]));
+	// What the film no longer contains is CLIPS-derived on both lanes, deliberately: a cut
+	// is authored on the film, and a take laid over it is silent through it without its own
+	// span saying so. Asking the placements instead would measure the cut against the take.
 	// A transcript is only projected once per asset even when several clips draw
 	// from it (line grouping is the expensive part, clipping is cheap).
 	const linesByAsset = new Map<string, CaptionSegment[]>();
 	const cues: CaptionCue[] = [];
 	let n = 0;
 
-	for (const assetId of new Set(clips.map((c) => c.assetId))) {
+	for (const assetId of new Set(placements.map((c) => c.assetId))) {
 		const transcript = transcripts.get(assetId);
 		if (!transcript) continue;
 		linesByAsset.set(assetId, captionLinesForAsset(transcript, settings, translations));
@@ -200,7 +229,12 @@ export function deriveCaptionCues(
 		for (const line of lines) {
 			const text = line.text.trim();
 			if (!text) continue;
-			for (const span of sourceSpanToTimelineSpans(assetId, line.startSec, line.endSec, clips)) {
+			for (const span of sourceSpanToTimelineSpans(
+				assetId,
+				line.startSec,
+				line.endSec,
+				placements,
+			)) {
 				const startMs = Math.round(span.startSec * 1000);
 				const endMs = Math.max(Math.round(span.endSec * 1000), startMs + 1);
 				cues.push({ id: `caption-${n++}`, startMs, endMs, text });
@@ -208,6 +242,10 @@ export function deriveCaptionCues(
 		}
 	}
 
+	// No removed-word filter. A cue inside a cut maps to source time inside frames
+	// `resolvePlaybackSegments` never emits, so it is already invisible in the preview and
+	// the export; dropping the words instead would re-flow every line boundary on any
+	// project with a trim — a visible change to output, bought for nothing.
 	cues.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
 	// Lines from one asset can't overlap, but two clips playing overlapping
 	// source ranges can put two cues on the same instant. Keep the ruler honest
@@ -232,6 +270,25 @@ export function captionCueAt(cues: CaptionCue[], timeMs: number): CaptionCue | n
 }
 
 /**
+ * A caption's region, which is an `AnnotationRegion` measured against a different box.
+ *
+ * The `space` marker is why this type exists instead of a field on `AnnotationRegion`:
+ * an annotation is authored on top of the visible video and must keep tracking the
+ * screen rect, while a caption belongs to the output frame. Widening the shared type
+ * would also put a frame-space band — whose `y` legitimately goes negative when it
+ * overhangs the frame edge — through `annotationRegionSchema`, which bounds position
+ * to 0..100. Captions are never stored, so they never meet that schema.
+ */
+export type CaptionTextRegion = AnnotationRegion & {
+	space: "frame";
+	/** Which edge of the drawn block the compositor pins to the region's box. Carried
+	 *  here rather than on `AnnotationTextStyle` for the same reason as `space`: an
+	 *  annotation must keep rendering centred, and widening the shared style would put
+	 *  the key in every stored annotation's payload. */
+	verticalAlign: CaptionAnchorV;
+};
+
+/**
  * Cues as text annotation regions, so the export renderer draws captions through
  * the exact same text path as annotations (wrapping, background plate,
  * alignment) instead of a second, subtly-different implementation.
@@ -242,9 +299,15 @@ export function captionCueAt(cues: CaptionCue[], timeMs: number): CaptionCue | n
 export function captionCuesToTextRegions(
 	cues: CaptionCue[],
 	settings: CaptionSettings,
-): AnnotationRegion[] {
-	const rect = captionBandRect(settings);
+	aspectValue: number,
+): CaptionTextRegion[] {
+	const rect = captionBoxRect(settings, aspectValue);
 	return cues.map((cue, index) => ({
+		space: "frame" as const,
+		// The edge the compositor pins the drawn block to inside `size`. Without it the
+		// rasterizers centre the block — which is what made a caption drift vertically
+		// every time its text wrapped to another line.
+		verticalAlign: rect.verticalAlign,
 		id: cue.id,
 		startMs: cue.startMs,
 		endMs: cue.endMs,
@@ -260,7 +323,10 @@ export function captionCuesToTextRegions(
 			fontWeight: settings.fontWeight,
 			fontStyle: "normal" as const,
 			textDecoration: "none" as const,
-			textAlign: settings.textAlign,
+			// One horizontal control, not two: `anchorH` picks which edge of the block is
+			// pinned to the column, and the rasterizers' plate maths already snaps the
+			// plate onto that edge (`text_linux.rs` `plate_x`, and its two mirrors).
+			textAlign: settings.anchorH,
 			textAnimation: "none" as const,
 		},
 		zIndex: CAPTION_Z_INDEX_BASE + index,

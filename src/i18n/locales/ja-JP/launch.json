@@ -6,8 +6,6 @@
 		"cancelRecording": "録画をキャンセル",
 		"pauseRecording": "録画を一時停止",
 		"resumeRecording": "録画を再開",
-		"openVideoFile": "動画ファイルを開く",
-		"openProject": "プロジェクトを開く",
 		"useVerticalTray": "縦型トレイを使用",
 		"useHorizontalTray": "横型トレイを使用",
 		"openStudio": "スタジオを開く",
@@ -58,6 +56,11 @@
 		"useEditableCursor": "編集可能なカーソルを使う",
 		"useSystemCursor": "システムカーソルを使う"
 	},
+	"autoZoom": {
+		"enable": "録画後の自動ズームをオンにする",
+		"disable": "録画後の自動ズームをオフにする",
+		"needsEditableCursor": "自動ズームには編集可能なカーソルが必要です。カーソルモードを切り替えてください。"
+	},
 	"sourceSelector": {
 		"loading": "ソースを読み込み中...",
 		"screens": "画面 ({{count}})",
@@ -93,6 +96,9 @@
 		"micHint": "マイクをテストするには話してください",
 		"noMicrophones": "マイクが見つかりません",
 		"preview": "プレビュー",
-		"previewUnavailable": "プレビューを利用できません"
+		"previewUnavailable": "プレビューを利用できません",
+		"about": "情報",
+		"version": "バージョン {{version}}",
+		"checkingForUpdates": "確認中…"
 	}
 }

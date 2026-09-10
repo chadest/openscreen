@@ -42,19 +42,23 @@ let shimSelectedSource: ShimDesktopSource | null = null;
 type ShimRecordingPrefs = {
 	micEnabled: boolean;
 	micDeviceId: string | null;
+	micDeviceName: string | null;
 	camEnabled: boolean;
 	camDeviceId: string | null;
 	systemAudioEnabled: boolean;
 	cursorCaptureMode: "editable-overlay" | "system";
+	autoZoomEnabled: boolean;
 };
 const recordingPrefsStorageKey = "browser-shim-recording-prefs";
 let shimRecordingPrefs: ShimRecordingPrefs = {
 	micEnabled: false,
 	micDeviceId: null,
+	micDeviceName: null,
 	camEnabled: false,
 	camDeviceId: null,
 	systemAudioEnabled: false,
 	cursorCaptureMode: "editable-overlay",
+	autoZoomEnabled: true,
 };
 (() => {
 	try {
@@ -122,6 +126,15 @@ function createShimElectronAPI() {
 		onRequestSaveBeforeClose: () => () => undefined,
 		loadProjectFileFromPath: () => Promise.resolve({ success: false, canceled: true }),
 		getPathForFile: () => "",
+		// Browser mode has no main process to ask, and no installer that could update it. A
+		// version still has to come back or the HUD's About block never renders at all.
+		getAppInfo: () => Promise.resolve({ version: "0.0.0-browser", canCheckForUpdates: false }),
+		checkForUpdates: () => Promise.resolve(),
+		// No main process means no native message box to open. Resolving silently keeps the app
+		// menu clickable in browser mode instead of rejecting into the item's onClick.
+		showAbout: () => Promise.resolve(),
+		// No installer in browser mode, so nothing may ever be checked.
+		canCheckForUpdatesNow: () => Promise.resolve(false),
 		getSources: () => Promise.resolve(SHIM_SOURCES),
 		selectSource: (source: ShimDesktopSource) => {
 			shimSelectedSource = source;
@@ -175,7 +188,7 @@ function createShimBridgeClient() {
 			updatedAt: string;
 			primaryAssetId?: string;
 		};
-		assets: Array<{ id: string; kind: "video"; label: string; originalPath: string }>;
+		assets: Array<{ id: string; kind: "video" | "audio"; label: string; originalPath: string }>;
 		[key: string]: unknown;
 	};
 	const projectsStorageKey = "browser-shim-projects-v2";
@@ -375,6 +388,7 @@ function createShimBridgeClient() {
 					},
 					annotations: [],
 					zoomRanges: [],
+					audioTracks: [],
 					legacyEditor: null,
 				};
 				documentsByProject[doc.project.id] = doc;
@@ -396,20 +410,27 @@ function createShimBridgeClient() {
 				saveProjectsState();
 				return Promise.resolve({ success: true });
 			},
-			addAsset: (projectId: string, path: string, label?: string) => {
+			addAsset: (projectId: string, path: string, label?: string, kind?: "video" | "audio") => {
 				const doc = documentsByProject[projectId];
 				if (!doc) return Promise.resolve({ assetId: "", document: null });
 				const assetId = `asset_${Math.random().toString(36).slice(2, 10)}`;
+				const assetKind = kind ?? "video";
 				const asset = {
 					id: assetId,
-					kind: "video" as const,
+					kind: assetKind,
 					label: label || path.split(/[\\/]/).pop() || "Recording",
 					originalPath: path,
 				};
+				// Mirror the main-process rule: an audio import never claims the empty
+				// primary slot (see document-service.addAsset).
+				const claimsPrimary = assetKind !== "audio" && !doc.project.primaryAssetId;
 				const next: ShimDocument = {
 					...doc,
 					assets: [...doc.assets, asset],
-					project: { ...doc.project, primaryAssetId: doc.project.primaryAssetId ?? assetId },
+					project: {
+						...doc.project,
+						primaryAssetId: claimsPrimary ? assetId : doc.project.primaryAssetId,
+					},
 				};
 				documentsByProject[projectId] = next;
 				saveProjectsState();

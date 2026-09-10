@@ -10,7 +10,7 @@
 //! letting a Rust panic unwind into C.
 
 use std::ffi::{c_char, c_void, CStr};
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[repr(C)]
@@ -46,7 +46,39 @@ pub struct RawFrame {
     pub crop_width: i32,
     pub crop_height: i32,
     pub has_crop: i32,
+    /// Zero-copy dmabuf hand-off (issue #507). When non-zero, `data` is null and
+    /// the frame is a tiled GPU buffer described by the fields below — imported
+    /// as a VAAPI surface rather than read from `data`. Layout mirrors
+    /// `struct osc_pw_frame` in pw_shim.h exactly.
+    pub is_dmabuf: i32,
+    pub modifier: u64,
+    pub drm_fourcc: u32,
+    pub n_planes: i32,
+    pub plane_fd: [i32; 4],
+    pub plane_offset: [i32; 4],
+    pub plane_stride: [i32; 4],
+    /// The `struct pw_buffer *` this frame came from (opaque). Returned to
+    /// `osc_pw_requeue_buffer` once the dmabuf import has copied the pixels, if
+    /// `on_frame` took ownership of it. Null/unused on the CPU path.
+    pub buffer_handle: *mut c_void,
+    /// Registration generation of `buffer_handle`, handed back with it so the
+    /// re-queue can reject a stale pointer a renegotiation reused (see the C side).
+    pub buffer_generation: u64,
 }
+
+/// A `struct pw_buffer *` we are holding out of PipeWire's queue until its dmabuf
+/// content has been imported, tagged with its registration `generation` so the
+/// re-queue can tell it from a newer buffer reusing the same slot. Send so it can
+/// travel through the mailbox; the pointer is only ever handed back to
+/// `osc_pw_requeue_buffer`, never dereferenced on the Rust side.
+#[derive(Debug, Clone, Copy)]
+pub struct BufferHandle {
+    pub ptr: *mut c_void,
+    pub generation: u64,
+}
+// SAFETY: the pointer is an opaque token owned by libpipewire; Rust neither reads
+// nor writes through it, only returns it to the shim's locked requeue.
+unsafe impl Send for BufferHandle {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +95,7 @@ struct RawCallbacks {
     user: *mut c_void,
     on_format: extern "C" fn(*mut c_void, *const RawFormat),
     on_cursor: extern "C" fn(*mut c_void, *const RawCursor),
-    on_frame: extern "C" fn(*mut c_void, *const RawFrame),
+    on_frame: extern "C" fn(*mut c_void, *const RawFrame) -> i32,
     on_buffer_info: extern "C" fn(*mut c_void, u32, u32, i32, u32, *const c_char),
     on_state: extern "C" fn(*mut c_void, *const c_char, *const c_char),
 }
@@ -106,11 +138,17 @@ extern "C" {
         fd: i32,
         node_id: u32,
         want_video: i32,
+        prefer_dmabuf: i32,
         callbacks: *const RawCallbacks,
         err: *mut c_char,
         err_len: usize,
     ) -> *mut RawSession;
     fn osc_pw_stop(session: *mut RawSession);
+    fn osc_pw_requeue_buffer(
+        session: *mut RawSession,
+        buffer_handle: *mut c_void,
+        buffer_generation: u64,
+    );
 }
 
 /// Where stream events go. Called on the PipeWire thread, so it must not block:
@@ -180,6 +218,65 @@ pub struct Frame {
     /// "invalid meta" and "meta covering everything" alike — none of which is a
     /// reason to crop, and none of which may be guessed apart.
     pub has_crop: bool,
+    /// Set for a tiled dmabuf frame (issue #507): `pixels` is empty and the
+    /// content is on the GPU, described here for a VAAPI import instead. The
+    /// owned fds close when the frame is dropped or superseded.
+    pub dmabuf: Option<DmabufDesc>,
+}
+
+/// A tiled dmabuf handed up for GPU import. Holds the PipeWire buffer OUT of the
+/// queue (via `buffer_handle`) so the plane fds AND their content stay valid until
+/// the import copies the surface — dup'ing the fds alone would preserve the object
+/// but not a content snapshot, letting the compositor overwrite a re-queued buffer
+/// (CodeRabbit / issue #507). On drop the handle is pushed to `requeue`, which the
+/// main loop drains and hands back to the shim's locked re-queue.
+pub struct DmabufDesc {
+    pub width: i32,
+    pub height: i32,
+    pub drm_fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<DmabufPlane>,
+    buffer_handle: BufferHandle,
+    requeue: std::sync::Arc<std::sync::Mutex<Vec<BufferHandle>>>,
+}
+
+impl std::fmt::Debug for DmabufDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmabufDesc")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("drm_fourcc", &self.drm_fourcc)
+            .field("modifier", &self.modifier)
+            .field("planes", &self.planes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DmabufDesc {
+    fn drop(&mut self) {
+        // Return the held PipeWire buffer once the import that read it is done
+        // (which is why this runs at drop, after `Capture::stage`). Pushed to the
+        // queue rather than re-queued here because re-queue must run on the main
+        // loop, not the PipeWire thread that supersedes a frame — see
+        // FrameMailbox and osc_pw_requeue_buffer.
+        if !self.buffer_handle.ptr.is_null() {
+            if let Ok(mut queue) = self.requeue.lock() {
+                queue.push(self.buffer_handle);
+            }
+        }
+    }
+}
+
+/// One dmabuf plane: an OWNED (dup'd) fd plus its layout. The dup is taken when the
+/// frame is claimed and closed when the owning `DmabufDesc` drops. Owning it — not
+/// borrowing the PipeWire buffer's fd — is what keeps the plane valid if a
+/// renegotiation destroys the buffer set (which closes the original fds and reuses
+/// the numbers) while this plane is still queued for import.
+#[derive(Debug)]
+pub struct DmabufPlane {
+    pub fd: OwnedFd,
+    pub offset: i32,
+    pub stride: i32,
 }
 
 /// A rectangle inside a captured frame, in stream pixels.
@@ -207,6 +304,11 @@ pub struct FrameMailbox {
     inner: std::sync::Mutex<Mailbox>,
     received: std::sync::atomic::AtomicU64,
     dropped: std::sync::atomic::AtomicU64,
+    /// PipeWire buffers held for a dmabuf import, to be re-queued once their
+    /// `DmabufDesc` drops (import done, or frame superseded). Drained by the main
+    /// loop, which re-queues each through the shim's locked path. Shared into each
+    /// `DmabufDesc` so its Drop can push here from either thread.
+    requeue: std::sync::Arc<std::sync::Mutex<Vec<BufferHandle>>>,
 }
 
 #[derive(Debug, Default)]
@@ -257,6 +359,43 @@ impl FrameMailbox {
                 height: meta.crop_height,
             },
             has_crop: meta.has_crop != 0,
+            dmabuf: None,
+        });
+        self.received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stores a tiled dmabuf frame — the descriptor only, no pixel copy. Same
+    /// newest-wins discipline as [`Self::put`]; a superseded frame's owned fds
+    /// close when its `Frame` drops here.
+    fn put_dmabuf(&self, desc: DmabufDesc, meta: &RawFrame) {
+        use std::sync::atomic::Ordering;
+
+        let Ok(mut inner) = self.inner.lock() else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let pixels = match inner.pending.take() {
+            Some(stale) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                stale.pixels
+            }
+            None => inner.spare.take().unwrap_or_default(),
+        };
+        inner.pending = Some(Frame {
+            pixels,
+            stride: meta.stride as usize,
+            width: meta.width,
+            height: meta.height,
+            video_format: meta.video_format,
+            pts_ns: meta.pts_ns,
+            crop: CropRect {
+                x: meta.crop_x,
+                y: meta.crop_y,
+                width: meta.crop_width,
+                height: meta.crop_height,
+            },
+            has_crop: meta.has_crop != 0,
+            dmabuf: Some(desc),
         });
         self.received.fetch_add(1, Ordering::Relaxed);
     }
@@ -274,6 +413,21 @@ impl FrameMailbox {
         };
         pixels.clear();
         inner.spare = Some(pixels);
+    }
+
+    /// A clone of the held-buffer re-queue queue, for a `DmabufDesc` to push its
+    /// PipeWire buffer to when it drops.
+    fn requeue_queue(&self) -> std::sync::Arc<std::sync::Mutex<Vec<BufferHandle>>> {
+        self.requeue.clone()
+    }
+
+    /// Takes the PipeWire buffers whose dmabuf imports have completed (or were
+    /// superseded), for the main loop to re-queue through the shim.
+    pub fn drain_requeue(&self) -> Vec<BufferHandle> {
+        match self.requeue.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Frames the compositor delivered.
@@ -295,22 +449,79 @@ impl FrameMailbox {
 /// only as a backstop against a consumer that has stopped consuming entirely —
 /// 48 kHz stereo f32 is 384 KB/s, so two seconds is under a megabyte.
 ///
-/// Overflow drops the OLDEST samples. If the encoder is that far behind, the
-/// recent audio is the part still worth keeping, and the alternative — refusing
-/// new samples — would freeze the track at the moment of the stall and leave
-/// everything after it misaligned.
+/// Overflow drops the OLDEST samples and OWES THE SAME NUMBER BACK AS SILENCE.
+/// Dropping the oldest is the easy half: if the encoder is that far behind, the
+/// recent audio is the part still worth keeping, and refusing new samples
+/// instead would freeze the track at the moment of the stall.
+///
+/// The silence is the half that matters, because a drop here leaves no hole.
+/// The encoder's presentation time is a running count of the samples handed to
+/// it (`AudioEncoder::next_pts`, encoder.rs), so removing samples does not shift
+/// the ones after them late — it pulls them EARLY, by the dropped duration, for
+/// the rest of the take. Every later sound would then sit before the picture it
+/// belongs to, permanently and by an amount nothing records. Standing in
+/// silence of exactly the dropped length keeps that count right, so an overflow
+/// costs a gap where it happened and nothing after it. The debt is a counter
+/// until someone drains, which is also the only thing that can stop it growing —
+/// and it stops being exact at [`MAX_SILENCE_SECONDS`], which is where a bounded
+/// allocation starts to matter more than sync nobody can still use.
+/// How much silence the ring will stand in for before it stops trying.
+///
+/// The debt costs a counter while it is owed and only becomes memory when
+/// someone drains — 384 KB per second of it, at 48 kHz stereo f32. A drain runs
+/// on every tick of the main loop, heartbeat included (`Capture::advance` from
+/// the `RecvTimeoutError::Timeout` arm in main.rs), so a debt worth seconds
+/// means the loop itself has stopped. There is no bound on how long a stopped
+/// loop stays stopped, and one that comes back materialises the whole stall in a
+/// single allocation — which is also the one place the ring's own two-second cap
+/// does not reach. There is a second, quieter way to get there: nothing drains
+/// before the first video frame either, so the debt grows for as long as the
+/// portal picker is up. That normally ends in `clear` rather than a drain, but
+/// not if staging that first frame fails, and the stop path flushes the ring.
+///
+/// Thirty seconds is far past any stall a recording survives, and past it the
+/// take has a hole half a minute wide — the cap trades sync that is already lost
+/// for an allocation that stays bounded. `dropped_samples` keeps counting the
+/// whole loss regardless, so the `audio-dropped` warning still reports what
+/// really happened rather than what could be paid back.
+const MAX_SILENCE_SECONDS: usize = 30;
+
 #[derive(Debug)]
 pub struct AudioRing {
-    inner: std::sync::Mutex<std::collections::VecDeque<f32>>,
+    inner: std::sync::Mutex<RingInner>,
     capacity: usize,
+    /// Ceiling on `RingInner::silence_owed`. See [`MAX_SILENCE_SECONDS`].
+    max_silence_owed: usize,
     dropped: std::sync::atomic::AtomicU64,
+}
+
+/// Everything the ring's correctness rests on, under one lock: the queue, the
+/// silence owed in front of it, and whether samples are being taken at all.
+///
+/// `accepting` LIVES HERE rather than in an atomic beside the mutex, and that is
+/// not a matter of taste. Read before the lock, a producer could pass the check,
+/// wait for a whole `pause` to run, and only then append — putting audio from
+/// the far side of a pause into the take, where a pause-then-stop would flush it
+/// into the file. Under the lock, "pause has returned" and "no further sample
+/// can enter" are the same instant.
+#[derive(Debug)]
+struct RingInner {
+    queue: std::collections::VecDeque<f32>,
+    /// Samples dropped on overflow and not yet stood in for.
+    silence_owed: usize,
+    accepting: bool,
 }
 
 impl AudioRing {
     pub fn new(seconds: usize, sample_rate: usize, channels: usize) -> Self {
         Self {
-            inner: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            inner: std::sync::Mutex::new(RingInner {
+                queue: std::collections::VecDeque::new(),
+                silence_owed: 0,
+                accepting: true,
+            }),
             capacity: seconds * sample_rate * channels,
+            max_silence_owed: MAX_SILENCE_SECONDS * sample_rate * channels,
             dropped: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -318,43 +529,94 @@ impl AudioRing {
     fn push(&self, samples: &[f32]) {
         use std::sync::atomic::Ordering;
 
-        let Ok(mut queue) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.lock() else {
             self.dropped.fetch_add(samples.len() as u64, Ordering::Relaxed);
             return;
         };
-        queue.extend(samples.iter().copied());
-        if queue.len() > self.capacity {
-            let excess = queue.len() - self.capacity;
-            queue.drain(..excess);
+        // Paused: refused at the door rather than queued and discarded later.
+        // See `pause` for why the discard had to go.
+        if !inner.accepting {
+            return;
+        }
+        inner.queue.extend(samples.iter().copied());
+        if inner.queue.len() > self.capacity {
+            let excess = inner.queue.len() - self.capacity;
+            inner.queue.drain(..excess);
+            // Capped, so one drain can never be asked for more than the ring's
+            // own capacity plus this. The tally below is NOT capped: what the
+            // warning reports is the loss, not the part of it that was paid for.
+            inner.silence_owed = (inner.silence_owed + excess).min(self.max_silence_owed);
             self.dropped.fetch_add(excess as u64, Ordering::Relaxed);
         }
     }
 
-    /// Moves everything queued into `out`, appending.
+    /// Moves everything queued into `out`, appending — behind any silence the
+    /// ring owes for samples it had to drop.
     pub fn drain_into(&self, out: &mut Vec<f32>) {
-        let Ok(mut queue) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        out.reserve(queue.len());
-        out.extend(queue.drain(..));
+        let owed = std::mem::take(&mut inner.silence_owed);
+        out.reserve(owed + inner.queue.len());
+        out.resize(out.len() + owed, 0.0);
+        out.extend(inner.queue.drain(..));
     }
 
     /// Discards everything queued, and forgets any overflow so far.
     ///
-    /// Called when the video epoch is set and on resume: audio captured before
-    /// the first frame, or during a pause, belongs to no part of the recording,
-    /// and keeping it would offset the whole track.
+    /// Called when the video epoch is set: audio captured before the first frame
+    /// belongs to no part of the recording, and keeping it would offset the
+    /// whole track.
     ///
     /// Resetting `dropped` is the point, not an afterthought. The stream is
     /// opened before the portal picker is raised, so it records for however long
     /// the user takes to click — easily past the ring's two-second cap. Counting
     /// that overflow would report "the encoder could not keep up" on every
-    /// single recording, for audio that was always going to be thrown away.
+    /// single recording, for audio that was always going to be thrown away. The
+    /// reset happens under the lock with the rest: outside it, a producer could
+    /// slip an overflow between the queue being emptied and the tally being
+    /// forgiven, and have a real loss forgiven along with the pre-roll.
     pub fn clear(&self) {
-        if let Ok(mut queue) = self.inner.lock() {
-            queue.clear();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.queue.clear();
+            inner.silence_owed = 0;
+            self.dropped.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        self.dropped.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stops taking samples. WHAT IS ALREADY QUEUED STAYS.
+    ///
+    /// Audio arriving while the recording is paused belongs to no part of it —
+    /// the video timeline does not advance across a pause, so keeping it would
+    /// push every later sample out of sync by the pause's length. Refusing it at
+    /// the door is what makes a discard at resume unnecessary, and the discard
+    /// is what did the damage. It threw away three things at once, all of them
+    /// from BEFORE the pause and all of them part of the take:
+    ///
+    ///   * the overflow tally, so a real mid-take drop never reached the
+    ///     `audio-dropped` warning (main.rs) — the only place a user is ever
+    ///     told a recording lost audio;
+    ///   * the silence owed for that drop, so the gap went unfilled and every
+    ///     later sample moved early anyway, which is the desync this ring
+    ///     exists to prevent;
+    ///   * and the queued samples themselves, up to a drain's worth of real
+    ///     recorded sound.
+    ///
+    /// With nothing able to enter while paused, what the ring holds at resume is
+    /// exactly what it held at pause, and the first drain after resume places it
+    /// where it belongs: the pause is spliced out of the video timeline too, so
+    /// the two sides join with no gap on either.
+    pub fn pause(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.accepting = false;
+        }
+    }
+
+    /// Takes samples again, from now.
+    pub fn resume(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.accepting = true;
+        }
     }
 
     pub fn dropped_samples(&self) -> u64 {
@@ -647,8 +909,12 @@ impl Session {
         node_id: u32,
         sink: Sink,
         frames: Option<std::sync::Arc<FrameMailbox>>,
+        // Offer dmabuf before shm for a whole-monitor GPU import (issue #507).
+        // Only honoured for a video session; ignored for cursor-only.
+        prefer_dmabuf: bool,
     ) -> Result<Self, String> {
         let want_video = i32::from(frames.is_some());
+        let prefer_dmabuf = i32::from(want_video != 0 && prefer_dmabuf);
         let state = Box::new(CallbackState { sink, frames });
         let user = &*state as *const CallbackState as *mut c_void;
         let callbacks = RawCallbacks {
@@ -668,6 +934,7 @@ impl Session {
                 fd.into_raw_fd(),
                 node_id,
                 want_video,
+                prefer_dmabuf,
                 &callbacks,
                 err.as_mut_ptr(),
                 ERR_LEN,
@@ -678,6 +945,16 @@ impl Session {
         }
 
         Ok(Self { raw, _state: state })
+    }
+
+    /// Re-queues a PipeWire buffer a dmabuf frame took ownership of, once its
+    /// import has copied the pixels. Call from the main loop (NOT the PipeWire
+    /// thread) — the shim takes the thread-loop lock. Drain the mailbox's
+    /// `drain_requeue` for the handles.
+    pub fn requeue(&self, handle: BufferHandle) {
+        // SAFETY: `raw` is a live session for the lifetime of `self`; the handle
+        // is an opaque pw_buffer token the shim validates and only re-queues.
+        unsafe { osc_pw_requeue_buffer(self.raw, handle.ptr, handle.generation) };
     }
 }
 
@@ -725,35 +1002,114 @@ extern "C" fn on_format(user: *mut c_void, format: *const RawFormat) {
     });
 }
 
-extern "C" fn on_frame(user: *mut c_void, frame: *const RawFrame) {
-    with_state(user, |state| {
-        let Some(mailbox) = state.frames.as_ref() else {
-            return;
-        };
-        if frame.is_null() {
-            return;
+/// Returns 1 when we TAKE OWNERSHIP of the PipeWire buffer — a tiled dmabuf held
+/// out of the queue until the main loop imports it — so the shim must not re-queue
+/// it. 0 otherwise (the CPU path, or any frame we decline), which re-queues as
+/// before.
+extern "C" fn on_frame(user: *mut c_void, frame: *const RawFrame) -> i32 {
+    if user.is_null() || frame.is_null() {
+        return 0;
+    }
+    // SAFETY: `user` is the CallbackState pointer given to osc_pw_start, valid for
+    // the session's lifetime; `frame` is valid for the callback's duration.
+    let state = unsafe { &*(user as *const CallbackState) };
+    // Same guard `with_state` gives every other callback, which this one cannot use
+    // because it returns a value: a panic (an allocation failure in
+    // `Vec::with_capacity`, a capacity overflow in `put`) must not unwind across the
+    // `extern "C"` boundary and abort the helper. Decline the frame on panic (0) so
+    // the shim re-queues it rather than leaking the buffer.
+    catch_unwind(AssertUnwindSafe(|| on_frame_inner(state, frame))).unwrap_or(0)
+}
+
+/// The body of [`on_frame`], split out so the callback can wrap it in
+/// `catch_unwind`. `frame` is non-null (checked by the caller) and valid for the
+/// callback's duration.
+fn on_frame_inner(state: &CallbackState, frame: *const RawFrame) -> i32 {
+    let Some(mailbox) = state.frames.as_ref() else {
+        return 0;
+    };
+    // SAFETY: non-null (checked in `on_frame`) and valid for the callback duration.
+    let frame = unsafe { &*frame };
+
+    // Tiled dmabuf: no pixels to copy. Take the PipeWire buffer (hold it out of
+    // the queue) so the plane fds AND their content stay valid until the main-loop
+    // import copies the surface; the buffer is re-queued when the DmabufDesc drops.
+    if frame.is_dmabuf != 0 {
+        // Decline a buffer the C side could not register (its live-buffer table was
+        // full — two overlapping sets across a renegotiation). Its generation is 0,
+        // which `osc_pw_requeue_buffer` refuses to re-queue, so holding it would
+        // leak it out of the pool for good. Returning 0 lets the shim re-queue it
+        // now; the frame is dropped instead (the previous one is held forward).
+        if frame.buffer_generation == 0 {
+            return 0;
         }
-        // SAFETY: non-NULL for the duration of the callback, by contract.
-        let frame = unsafe { &*frame };
-        if frame.data.is_null() || frame.stride <= 0 || frame.height <= 0 {
-            return;
+        let n = frame.n_planes.clamp(0, 4) as usize;
+        if n == 0 {
+            return 0;
         }
-        // Copy only the rows, not the whole mapping. `size` can include trailing
-        // slack the compositor allocated, and re-checking the product here means
-        // the slice below cannot outrun the region the C side validated.
-        let Some(rows) = (frame.stride as usize).checked_mul(frame.height as usize) else {
-            return;
-        };
-        if rows > frame.size {
-            return;
+        let mut planes = Vec::with_capacity(n);
+        for i in 0..n {
+            let fd = frame.plane_fd[i];
+            if fd < 0 {
+                return 0;
+            }
+            // Dup the plane fd so the descriptor owns a handle independent of the
+            // PipeWire buffer's lifetime: if a renegotiation destroys the buffer set
+            // while this desc is still queued for import, the original fds are closed
+            // and their numbers reused, and a borrowed fd would then import an
+            // unrelated buffer. The dup keeps the dmabuf alive until the OwnedFd drops
+            // with the desc, after `Capture::stage`; VAAPI dups again during surface
+            // creation, so it costs nothing past import.
+            // SAFETY: `fd` is valid for this callback; `try_clone_to_owned` dups it.
+            let Ok(owned) = (unsafe { BorrowedFd::borrow_raw(fd) }).try_clone_to_owned() else {
+                // fd exhaustion: decline. `planes` drops here, closing the dups taken
+                // so far, and the shim re-queues the buffer.
+                return 0;
+            };
+            planes.push(DmabufPlane {
+                fd: owned,
+                offset: frame.plane_offset[i],
+                stride: frame.plane_stride[i],
+            });
         }
-        // SAFETY: the shim clamped `size` against the mapping's `maxsize` before
-        // the callback, `rows <= size` was just checked, and the mapping stays
-        // live until this returns.
-        let pixels = unsafe { std::slice::from_raw_parts(frame.data, rows) };
-        mailbox.put(pixels, frame);
+        mailbox.put_dmabuf(
+            DmabufDesc {
+                width: frame.width,
+                height: frame.height,
+                drm_fourcc: frame.drm_fourcc,
+                modifier: frame.modifier,
+                planes,
+                buffer_handle: BufferHandle {
+                    ptr: frame.buffer_handle,
+                    generation: frame.buffer_generation,
+                },
+                requeue: mailbox.requeue_queue(),
+            },
+            frame,
+        );
         (state.sink)(StreamEvent::FrameReady);
-    });
+        return 1;
+    }
+
+    if frame.data.is_null() || frame.stride <= 0 || frame.height <= 0 {
+        return 0;
+    }
+    // Copy only the rows, not the whole mapping. `size` can include trailing
+    // slack the compositor allocated, and re-checking the product here means
+    // the slice below cannot outrun the region the C side validated.
+    let Some(rows) = (frame.stride as usize).checked_mul(frame.height as usize) else {
+        return 0;
+    };
+    if rows > frame.size {
+        return 0;
+    }
+    // SAFETY: the shim clamped `size` against the mapping's `maxsize` before
+    // the callback, `rows <= size` was just checked, and the mapping stays
+    // live until this returns.
+    let pixels = unsafe { std::slice::from_raw_parts(frame.data, rows) };
+    mailbox.put(pixels, frame);
+    (state.sink)(StreamEvent::FrameReady);
+    0
 }
 
 extern "C" fn on_buffer_info(
@@ -920,7 +1276,8 @@ mod tests {
         // The advertised modifier set is a real set, not a wildcard: a tiled or
         // compressed buffer cannot be read through a plain mmap, so it must fail
         // negotiation rather than be accepted and decoded into garbage.
-        // 0x0300000000000001 = a vendor (AMD) modifier, neither LINEAR nor INVALID.
+        // 0x0300000000000001 = a vendor (NVIDIA — modifier vendor byte 0x03) modifier,
+        // neither LINEAR nor INVALID.
         assert_eq!(
             enum_format_accepts_dmabuf_producer(true, 0x0300_0000_0000_0001),
             0,
@@ -978,6 +1335,8 @@ mod tests {
             // Cursor-only: this test is about negotiation reaching `streaming`
             // and about which metadata survives, neither of which needs pixels.
             None,
+            // Cursor-only, so dmabuf preference is irrelevant.
+            false,
         )
         .expect("stream must connect");
 
@@ -1071,5 +1430,135 @@ mod source_tests {
             println!("  {}  <-  {}", source.name, source.description);
         }
         assert!(!sources.is_empty(), "a desktop session always has at least one capture node");
+    }
+}
+
+#[cfg(test)]
+mod audio_ring_tests {
+    use super::AudioRing;
+
+    /// Capacity 16 samples — small enough to overflow by hand, and the unit the
+    /// ring counts in is interleaved samples, not frames.
+    fn ring() -> AudioRing {
+        AudioRing::new(1, 8, 2)
+    }
+
+    #[test]
+    fn overflow_is_stood_in_for_by_silence_rather_than_pulling_the_take_earlier() {
+        // THE regression. The encoder's timestamps are a running count of the
+        // samples it was handed (`AudioEncoder::next_pts`), so samples removed
+        // from the middle of the stream do not leave a hole — every later sound
+        // arrives that much earlier than the picture it belongs to, for the rest
+        // of the take, and nothing in the file records that it happened.
+        let ring = ring();
+        ring.push_for_test(&vec![1.0; 40]);
+        assert_eq!(ring.dropped_samples(), 24, "40 samples into a 16-sample ring drops 24");
+
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+
+        assert_eq!(out.len(), 40, "the drain must cover as much time as was pushed");
+        assert!(out[..24].iter().all(|sample| *sample == 0.0), "the drop reads as silence");
+        assert!(out[24..].iter().all(|sample| *sample == 1.0), "the survivors are the newest");
+    }
+
+    #[test]
+    fn the_silence_owed_stops_growing_before_the_allocation_does() {
+        // A drain turns the debt into real samples, and nothing else bounds how
+        // large it can get: the loop can stop for an unbounded stretch and then
+        // come back. `ring()` is 8 Hz stereo, so the cap is 30 s = 480 samples.
+        let ring = ring();
+        ring.push_for_test(&vec![1.0; 5_000]);
+
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        assert_eq!(
+            out.len(),
+            480 + 16,
+            "a drain may never be asked for more than the cap plus the ring's own capacity"
+        );
+        assert_eq!(
+            ring.dropped_samples(),
+            4_984,
+            "and the tally still reports the whole loss, not the part paid back"
+        );
+    }
+
+    #[test]
+    fn the_silence_owed_is_paid_once() {
+        let ring = ring();
+        ring.push_for_test(&vec![1.0; 40]);
+        let mut first = Vec::new();
+        ring.drain_into(&mut first);
+
+        ring.push_for_test(&[0.5, 0.5]);
+        let mut second = Vec::new();
+        ring.drain_into(&mut second);
+        assert_eq!(second, vec![0.5, 0.5], "a settled debt must not be paid again");
+    }
+
+    #[test]
+    fn a_pause_refuses_what_arrives_and_keeps_what_was_already_there() {
+        // Both halves matter. What arrives during a pause must not enter — the
+        // video timeline does not advance across one, so encoding it would push
+        // every later sample out by the pause's length. What was already queued
+        // must not leave: it was captured BEFORE the pause and is take audio.
+        let ring = ring();
+        ring.push_for_test(&[1.0; 10]);
+
+        ring.pause();
+        ring.push_for_test(&[0.75; 400]);
+        assert_eq!(ring.dropped_samples(), 0, "a pause discards, it does not drop");
+
+        ring.resume();
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        assert_eq!(out, vec![1.0; 10], "the pre-pause audio is still there, and only it");
+
+        // `drain_into` appends, so this asks the question of a fresh buffer.
+        let mut after = Vec::new();
+        ring.push_for_test(&[0.25, 0.25]);
+        ring.drain_into(&mut after);
+        assert_eq!(after, vec![0.25, 0.25], "and the ring takes samples again after it");
+    }
+
+    #[test]
+    fn a_drop_before_a_pause_is_still_stood_in_for_after_it() {
+        // The pause used to clear the ring, which deleted the silence owed for
+        // an overflow that had happened before it while LEAVING the tally that
+        // reports it. Both halves were wrong at once: the recording lost the
+        // compensation, so everything after the pause moved early, and the
+        // `audio-dropped` warning claimed a silence that was never written.
+        let ring = ring();
+        ring.push_for_test(&vec![1.0; 40]);
+        assert_eq!(ring.dropped_samples(), 24);
+
+        ring.pause();
+        ring.resume();
+
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        assert_eq!(out.len(), 40, "the pause must not eat the time the drop stands for");
+        assert!(out[..24].iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            ring.dropped_samples(),
+            24,
+            "and what the warning reports still matches what the track got"
+        );
+    }
+
+    #[test]
+    fn clearing_forgets_the_overflow_and_the_silence_it_owed() {
+        // The pre-roll case: everything captured before the first video frame is
+        // thrown away wholesale, so neither the drop nor the gap it left is part
+        // of any recording.
+        let ring = ring();
+        ring.push_for_test(&vec![1.0; 40]);
+        ring.clear();
+        assert_eq!(ring.dropped_samples(), 0);
+
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        assert!(out.is_empty(), "a cleared ring owes no silence");
     }
 }

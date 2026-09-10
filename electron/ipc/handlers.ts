@@ -16,11 +16,15 @@ import {
 	shell,
 	systemPreferences,
 } from "electron";
+import type { AxcutDocument } from "../../src/lib/ai-edition/schema";
 import {
 	type NativeLinuxRecordingRequest,
 	portalCursorMode,
 } from "../../src/lib/nativeLinuxRecording";
-import type { NativeMacRecordingRequest } from "../../src/lib/nativeMacRecording";
+import {
+	collectMacCaptureExcludedWindowIds,
+	type NativeMacRecordingRequest,
+} from "../../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../../src/lib/nativeWindowsRecording";
 import {
 	type CursorCaptureMode,
@@ -52,8 +56,9 @@ import {
 import type { CursorTelemetryReader } from "../ai-edition/deep-agent/service";
 import { DocumentService } from "../ai-edition/document-service";
 import { LlmConfigStore } from "../ai-edition/llm-config-store";
-import { mainLogBuffer } from "../diagnostics/main-log-buffer";
+import { isDiagnosticModeEnabled, mainLogBuffer } from "../diagnostics/main-log-buffer";
 import { mainT } from "../i18n";
+import { getInstallChannel } from "../install-channel";
 import { RECORDINGS_DIR } from "../main";
 import { type AudioPeaksResult, getAudioPeaks } from "../media/audioPeaks";
 import {
@@ -68,16 +73,27 @@ import {
 	LinuxNativeCaptureSession,
 } from "../native-bridge/capture/linuxNativeCaptureSession";
 import { createCursorRecordingSession } from "../native-bridge/cursor/recording/factory";
-import { requestMacCursorAccessibilityAccess } from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
+import {
+	isMacCursorHelperUnavailable,
+	requestMacCursorAccessibilityAccess,
+} from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
 import { findPipeWireCursorHelperPath } from "../native-bridge/cursor/recording/pipeWireCursorRecordingSession";
 import type { CursorRecordingSession } from "../native-bridge/cursor/recording/session";
+import { toHelperRect } from "../native-bridge/helperCoordinates";
+import { scoreDeviceNameMatch } from "../recording/deviceNameMatching";
 import {
+	isSalvageableFragmentedCapture,
+	NATIVE_WINDOWS_SALVAGEABLE_OUTPUT_BYTES,
+	readMicrophoneDefaulted,
+	readWebcamFormat,
+	readWebcamUnavailable,
 	terminateNativeWindowsCapture,
 	waitForNativeWindowsCaptureStop,
 } from "../recording/nativeWindowsCaptureStop";
 import { patchWebmDurationOnDisk } from "../recording/webm-duration";
 import { reindexRecordingOnDisk } from "../recording/webm-seek-index";
 import { registerNativeBridgeHandlers } from "./nativeBridge";
+import { registerRecordingPrefsHandlers } from "./recordingPrefs";
 import { RecordingStreamRegistry, registerRecordingStreamHandlers } from "./recordingStream";
 
 const PROJECT_FILE_EXTENSION = "openscreen";
@@ -96,7 +112,35 @@ const ALLOWED_IMPORT_VIDEO_EXTENSIONS = new Set([
 	".ts",
 ]);
 const PREVIEW_AUDIO_DIR = path.join(app.getPath("userData"), "preview-audio");
+// See the save-recorded-voiceover handler: an upper bound on renderer-supplied
+// bytes written to disk, well past any plausible take.
+const MAX_RECORDED_VOICEOVER_BYTES = 512 * 1024 * 1024;
 const nativeMacCaptureEvents = new EventEmitter();
+
+// Enumeration walks every display and window and grabs a thumbnail of each, so it
+// is allowed to be slow on a loaded machine. It is not allowed to be unbounded.
+// Deliberately above the CLI runner's own 20s bound, so the more specific message
+// there still wins for `openscreen sources`; this is the backstop for everything
+// else that calls get-sources.
+const GET_SOURCES_TIMEOUT_MS = 30_000;
+
+/**
+ * Reject if `work` has not settled within `ms`.
+ *
+ * The abandoned promise keeps running — there is no way to cancel a
+ * desktopCapturer call — so this bounds the *wait*, not the work. That is the
+ * whole available remedy: an unbounded await leaves a caller with no error and no
+ * way out, which is strictly worse than a late failure it can report.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return Promise.race([
+		work,
+		new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(new Error(message)), ms);
+		}),
+	]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
 
 // Paths the user approved via file picker or project load (i.e. outside the default dirs).
 const approvedPaths = new Set<string>();
@@ -148,6 +192,34 @@ function buildDialogOptions<T extends Electron.OpenDialogOptions | Electron.Save
 
 function hasAllowedImportVideoExtension(filePath: string): boolean {
 	return ALLOWED_IMPORT_VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+// Imported audio (issue #350). Kept separate from the video set so the two
+// pickers stay honest — an audio picker must not approve a video path and vice
+// versa. A SUBSET of SUPPORTED_AUDIO_EXTENSIONS in the document service, which
+// also accepts `.webm`: that gate is told the kind by its caller, while this one
+// only has the extension to go on and `.webm` is far more often a video.
+const ALLOWED_IMPORT_AUDIO_EXTENSIONS = new Set([
+	".mp3",
+	".wav",
+	".m4a",
+	".aac",
+	".flac",
+	".ogg",
+	".opus",
+]);
+
+function hasAllowedImportAudioExtension(filePath: string): boolean {
+	return ALLOWED_IMPORT_AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+// Video OR audio. The type-specific pickers stay honest (see the audio set's
+// comment), but the generic media READS — peaks, binary, file-info, chunk — serve
+// whichever kind the document points at, so they must accept both. Gating them on
+// video alone dropped every imported audio path once `approvedPaths` was empty
+// (a project reopen), and the waveform was lost for good (issue #350).
+function hasAllowedImportMediaExtension(filePath: string): boolean {
+	return hasAllowedImportVideoExtension(filePath) || hasAllowedImportAudioExtension(filePath);
 }
 
 function runProcess(
@@ -246,8 +318,13 @@ async function prepareSupplementalPreviewAudioTrack(videoPath: string) {
 	return { success: true, path: pathToFileURL(outputPath).toString() };
 }
 
-async function approveReadableVideoPath(
-	filePath?: string | null,
+// Shared core behind the media path approvers. `hasAllowedExtension` is the ONLY
+// thing that differs between video and audio imports, so it is the single knob:
+// an already-approved path passes regardless, otherwise the extension gate,
+// optional trusted-dir confinement, and a stat check decide whether to approve.
+async function approveReadableMediaPath(
+	filePath: string | null | undefined,
+	hasAllowedExtension: (p: string) => boolean,
 	trustedDirs?: string[],
 ): Promise<string | null> {
 	const normalizedPath = normalizeVideoSourcePath(filePath);
@@ -259,7 +336,7 @@ async function approveReadableVideoPath(
 		return normalizedPath;
 	}
 
-	if (!hasAllowedImportVideoExtension(normalizedPath)) {
+	if (!hasAllowedExtension(normalizedPath)) {
 		return null;
 	}
 
@@ -284,6 +361,53 @@ async function approveReadableVideoPath(
 
 	approveFilePath(normalizedPath);
 	return normalizedPath;
+}
+
+function approveReadableVideoPath(
+	filePath?: string | null,
+	trustedDirs?: string[],
+): Promise<string | null> {
+	return approveReadableMediaPath(filePath, hasAllowedImportVideoExtension, trustedDirs);
+}
+
+function approveReadableAudioPath(
+	filePath?: string | null,
+	trustedDirs?: string[],
+): Promise<string | null> {
+	return approveReadableMediaPath(filePath, hasAllowedImportAudioExtension, trustedDirs);
+}
+
+/**
+ * A path a generic read may use — and NOT a way to obtain one.
+ *
+ * `approveReadableMediaPath` grants approval to any existing file with a media extension.
+ * Behind a picker or a document load that is the point; behind `read-binary-file` it meant
+ * the renderer could name any media file on the machine and have its bytes handed back,
+ * which is a capability no generic handler should carry (CWE-200).
+ *
+ * Approval is granted in exactly three places now: the recordings directory, a file the user
+ * picked, and the assets a loaded project declares (`approveDocumentMedia`). Everything else
+ * spends one.
+ */
+function readableApprovedPath(filePath?: string | null): string | null {
+	const normalizedPath = normalizeVideoSourcePath(filePath);
+	if (!normalizedPath) return null;
+	if (!isPathAllowed(normalizedPath)) return null;
+	// The extension check stays: an approval granted for a recording must not become a way
+	// to read the project file, the log, or anything else sitting beside it.
+	if (!hasAllowedImportMediaExtension(normalizedPath)) return null;
+	return normalizedPath;
+}
+
+/** Grant the media a loaded project declares. The document is the app's own file, and this
+ *  is what the picker's approval decays into once the app restarts. */
+function approveDocumentMedia(document: AxcutDocument): void {
+	for (const asset of document.assets ?? []) {
+		const media = normalizeVideoSourcePath(asset.originalPath);
+		if (media && hasAllowedImportMediaExtension(media)) approveFilePath(media);
+		const camera = normalizeVideoSourcePath(asset.cameraTrack?.sourcePath);
+		if (camera && hasAllowedImportMediaExtension(camera)) approveFilePath(camera);
+	}
 }
 
 function resolveRecordingOutputPath(fileName: string): string {
@@ -464,23 +588,39 @@ let currentRecordingSession: RecordingSession | null = null;
 // useScreenRecorder (a separate renderer, own process, own React tree) picks
 // up those choices instead of silently reverting to its own defaults when
 // startNewRecording() switches windows. Mirrors the selectedSource pattern
-// above (in-memory, broadcast on change) rather than persisting to disk —
-// this is a live session preference, not project content.
+// above (in-memory, broadcast on change). Auto-zoom is the one durable choice;
+// the device selections remain session preferences, not project content.
 export interface RecordingPrefs {
 	micEnabled: boolean;
 	micDeviceId: string | null;
+	/**
+	 * The microphone's LABEL, carried beside its id because the native Windows
+	 * helper selects by name and Chromium selects by id.
+	 *
+	 * Without it, a HUD rebuilt for a new recording restored the id and had to
+	 * re-derive the name from its own `enumerateDevices()` — which needs a full
+	 * getUserMedia permission round-trip first, and an auto-started recording
+	 * beat it. The request then went out with no name at all, and the helper
+	 * answers that by recording the Windows default endpoint instead of the
+	 * microphone the user picked (getopenscreen/openscreen#404).
+	 */
+	micDeviceName: string | null;
 	camEnabled: boolean;
 	camDeviceId: string | null;
 	systemAudioEnabled: boolean;
 	cursorCaptureMode: CursorCaptureMode;
+	/** After a take, suggest cursor-dwell zooms. Default on, matching 1.5. */
+	autoZoomEnabled: boolean;
 }
-let recordingPrefs: RecordingPrefs = {
+const defaultRecordingPrefs: RecordingPrefs = {
 	micEnabled: false,
 	micDeviceId: null,
+	micDeviceName: null,
 	camEnabled: false,
 	camDeviceId: null,
 	systemAudioEnabled: false,
 	cursorCaptureMode: "editable-overlay",
+	autoZoomEnabled: true,
 };
 
 // Cached source from the user's pick. Used by setDisplayMediaRequestHandler in main.ts for cursor-free capture.
@@ -537,6 +677,12 @@ let nativeWindowsCursorRecordingStartMs = 0;
 let nativeWindowsPauseStartedAtMs: number | null = null;
 let nativeWindowsPauseRanges: Array<{ startMs: number; endMs: number }> = [];
 let nativeWindowsIsPaused = false;
+/**
+ * The MP4 flavour the helper reported for THIS run, or null if it never said.
+ * Read at stop, not for reporting: it is what decides whether a capture that
+ * failed to finalize still left a playable file behind.
+ */
+let nativeWindowsCaptureContainer: string | null = null;
 /** Cuts a surviving helper's output loose so it cannot pollute the next recording. */
 let nativeWindowsCaptureDrainCleanup: (() => void) | null = null;
 
@@ -557,14 +703,17 @@ function resetNativeWindowsCaptureState() {
 	nativeWindowsPauseStartedAtMs = null;
 	nativeWindowsPauseRanges = [];
 	nativeWindowsIsPaused = false;
+	nativeWindowsCaptureContainer = null;
 }
 
-/**
- * An MP4 the helper never indexed is a few bytes of header at most. Anything
- * larger might be a real recording, and deleting one of those to tidy up after
- * a failed stop is a far worse outcome than leaving a stray file behind.
- */
-const NATIVE_WINDOWS_SALVAGEABLE_OUTPUT_BYTES = 64 * 1024;
+/** Reads the file, then defers the judgement to the tested predicate. */
+async function salvageNativeWindowsFragmentedCapture(screenVideoPath: string | null) {
+	if (!screenVideoPath) {
+		return false;
+	}
+	const stats = await fs.stat(screenVideoPath).catch(() => null);
+	return isSalvageableFragmentedCapture(nativeWindowsCaptureContainer, stats?.size ?? null);
+}
 
 /**
  * Best-effort removal of the files a failed or discarded native Windows capture
@@ -932,40 +1081,6 @@ function isWindowsGraphicsCaptureOsSupported() {
 	return Number.isFinite(build) && build >= 19041;
 }
 
-function normalizeNativeDeviceName(value: string) {
-	return value
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, " ")
-		.trim();
-}
-
-function scoreNativeDeviceName(candidateName: string, candidateId: string, requestedName?: string) {
-	const candidate = normalizeNativeDeviceName(candidateName);
-	const id = normalizeNativeDeviceName(candidateId);
-	const requested = normalizeNativeDeviceName(requestedName ?? "");
-	if (!requested) {
-		return 0;
-	}
-	if (candidate === requested) {
-		return 1000;
-	}
-	if (candidate.includes(requested) || requested.includes(candidate)) {
-		return 900;
-	}
-	if (id.includes(requested) || requested.includes(id)) {
-		return 800;
-	}
-
-	return requested
-		.split(/\s+/)
-		.filter((word) => word.length > 1 && !["camera", "webcam", "video", "input"].includes(word))
-		.reduce((score, word) => {
-			if (candidate.includes(word)) return score + 100;
-			if (id.includes(word)) return score + 50;
-			return score;
-		}, 0);
-}
-
 function queryDirectShowVideoInputRegistry() {
 	return new Promise<string>((resolve) => {
 		const proc = spawn(
@@ -1010,7 +1125,7 @@ async function resolveDirectShowWebcamClsid(deviceName?: string) {
 	let best: { clsid: string; friendlyName?: string; score: number } | null = null;
 	for (const entry of entries) {
 		if (!entry.clsid) continue;
-		const score = scoreNativeDeviceName(entry.friendlyName ?? "", entry.clsid, deviceName);
+		const score = scoreDeviceNameMatch(entry.friendlyName ?? "", entry.clsid, deviceName);
 		if (!best || score > best.score) {
 			best = { clsid: entry.clsid, friendlyName: entry.friendlyName, score };
 		}
@@ -1312,25 +1427,6 @@ function sendNativeWindowsStopCommand(proc: ChildProcessWithoutNullStreams) {
 	return true;
 }
 
-function readNativeWindowsWebcamFormat(output: string) {
-	const lines = output.split(/\r?\n/).filter((line) => line.includes('"event":"webcam-format"'));
-	const lastLine = lines.at(-1);
-	if (!lastLine) {
-		return null;
-	}
-
-	try {
-		return JSON.parse(lastLine) as {
-			width?: number;
-			height?: number;
-			fps?: number;
-			deviceName?: string;
-		};
-	} catch {
-		return null;
-	}
-}
-
 function readNativeWindowsEncoderSelection(output: string) {
 	const lines = output
 		.split(/\r?\n/)
@@ -1343,7 +1439,20 @@ function readNativeWindowsEncoderSelection(output: string) {
 	try {
 		return JSON.parse(lastLine) as {
 			video?: string;
+			// Which MP4 flavour the helper actually wrote, `fragmented-mp4` or
+			// `mp4`. It reports this because the fragmented sink degrades to the
+			// plain one rather than failing a recording, so the flavour is a
+			// per-run outcome and not a property of the version. This is the only
+			// thing that can answer "was this file supposed to survive a kill?",
+			// which is what `salvageNativeWindowsFragmentedCapture` asks.
+			container?: string;
 			preferSoftwareEncoder?: boolean;
+			// Whether BeginWriting() actually landed on a hardware H.264 MFT, as
+			// opposed to `video` above, which only says which configuration path
+			// was tried. "default" plus a software runtime means the machine never
+			// got hardware acceleration in the first place -- see
+			// kVideoEncoderRuntime* in mf_encoder.h.
+			videoEncoderRuntime?: string;
 		};
 	} catch {
 		return null;
@@ -1649,6 +1758,66 @@ async function resolveMediaLinksForVideo(videoPath: string): Promise<{
 	return { resolvedVia: "none" };
 }
 
+/**
+ * Writes the diagnostic bundle a bug report needs: app/OS facts, the native
+ * helpers' raw stdout/stderr (which is where `[stop-timing]` and
+ * `encoder-selection` land — see nativeWindowsCaptureStop.ts), and the main
+ * process's own recent console output. Shared by the renderer's IPC call and
+ * the menu/tray "Save Diagnostics" entry point in main.ts, which has no
+ * renderer-side `projectState`/`logs` to offer and does not need to.
+ */
+export async function exportDiagnosticFile(payload: {
+	error: string;
+	stack?: string;
+	projectState: unknown;
+	logs: string[];
+}) {
+	const { filePath, canceled } = await dialog.showSaveDialog({
+		title: "Save Diagnostic File",
+		defaultPath: `openscreen-diagnostic-${Date.now()}.json`,
+		filters: [{ name: "JSON", extensions: ["json"] }],
+	});
+
+	if (canceled || !filePath) return { success: false, canceled: true };
+
+	const HELPER_OUTPUT_MAX_BYTES = 64 * 1024;
+	const tail = (s: string, max: number) => (s.length <= max ? s : s.slice(s.length - max));
+
+	const diagnostic = {
+		timestamp: new Date().toISOString(),
+		appVersion: app.getVersion(),
+		platform: process.platform,
+		arch: process.arch,
+		// The same fact the About box leads with, and for the same reason: it is what
+		// explains why a copy does or does not offer an update check. This file is the
+		// artifact users actually attach, so it must not be the one that omits it.
+		channel: getInstallChannel(),
+		osRelease: os.release(),
+		osVersion: os.version(),
+		totalMemoryMB: Math.round(os.totalmem() / 1024 / 1024),
+		nodeVersion: process.versions.node,
+		electronVersion: process.versions.electron,
+		chromeVersion: process.versions.chrome,
+		error: payload.error,
+		stack: payload.stack,
+		projectState: payload.projectState,
+		recentLogs: payload.logs,
+		helperOutput: {
+			windows: tail(nativeWindowsCaptureOutput, HELPER_OUTPUT_MAX_BYTES),
+			mac: tail(nativeMacCaptureOutput, HELPER_OUTPUT_MAX_BYTES),
+		},
+		mainProcessLogs: mainLogBuffer.snapshot(),
+	};
+
+	try {
+		await fs.writeFile(filePath, JSON.stringify(diagnostic, null, 2), "utf-8");
+		return { success: true, path: filePath };
+	} catch (error) {
+		console.error("Failed to write diagnostic file:", error);
+		return { success: false, error: String(error) };
+	}
+}
+
 export function registerIpcHandlers(
 	createEditorWindow: () => void,
 	createSourceSelectorWindow: () => BrowserWindow,
@@ -1699,7 +1868,48 @@ export function registerIpcHandlers(
 	}
 
 	ipcMain.handle("get-sources", async (_, opts) => {
-		const sources = await desktopCapturer.getSources(opts);
+		// desktopCapturer.getSources can never settle where the GL stack cannot be
+		// reached -- a container, a CI runner, a host whose ANGLE fails to
+		// initialise. Bounded here rather than per-caller because every caller has
+		// the same exposure and none of them can cancel this call: the CLI runners
+		// (`sources`, `record`) and the GUI pickers (SourceSelector, RecStage) all
+		// await it, and a renderer-side race would only stop *waiting* while this
+		// keeps running and its reply goes to nobody. Rejecting is what turns an
+		// indefinite spinner into the pickers' existing error branch.
+		// How long it actually took, under the existing diagnostic flag. The bound
+		// above turned an indefinite hang into a named failure, which is where the
+		// open question starts rather than ends: on a headless runner `openscreen
+		// sources` gets an answer within 20s four times in five while `record` --
+		// the same call with the same options -- exceeds 30s every time. A duration
+		// on both paths is what tells those apart; a threshold alone cannot.
+		const startedAt = Date.now();
+		const diagnostic = isDiagnosticModeEnabled();
+		let sources: Awaited<ReturnType<typeof desktopCapturer.getSources>>;
+		try {
+			sources = await withDeadline(
+				desktopCapturer.getSources(opts),
+				GET_SOURCES_TIMEOUT_MS,
+				`Desktop source enumeration did not return within ${GET_SOURCES_TIMEOUT_MS}ms. ` +
+					"This usually means the display or GPU stack cannot be reached — check that a display server is available.",
+			);
+		} catch (error) {
+			if (diagnostic) {
+				// The reason, not an assumption about it: this catch also sees a
+				// getSources that rejected on its own, well inside the deadline, and
+				// calling that a timeout would point the next reader at the wrong thing.
+				// The deadline error carries its own wording.
+				const reason = error instanceof Error ? error.message : String(error);
+				console.info(
+					`[get-sources] failed after ${Date.now() - startedAt}ms (types=${(opts?.types ?? []).join(",")}): ${reason}`,
+				);
+			}
+			throw error;
+		}
+		if (diagnostic) {
+			console.info(
+				`[get-sources] returned ${sources.length} source(s) in ${Date.now() - startedAt}ms (types=${(opts?.types ?? []).join(",")})`,
+			);
+		}
 		lastEnumeratedSources = new Map(sources.map((source) => [source.id, source]));
 		return sources.map((source) => ({
 			id: source.id,
@@ -1745,18 +1955,7 @@ export function registerIpcHandlers(
 		return selectedSource;
 	});
 
-	ipcMain.handle("get-recording-prefs", () => {
-		return recordingPrefs;
-	});
-
-	ipcMain.handle("set-recording-prefs", (_, prefs: Partial<RecordingPrefs>) => {
-		recordingPrefs = { ...recordingPrefs, ...prefs };
-		const mainWin = getMainWindow();
-		if (mainWin && !mainWin.isDestroyed()) {
-			mainWin.webContents.send("recording-prefs-changed", recordingPrefs);
-		}
-		return recordingPrefs;
-	});
+	registerRecordingPrefsHandlers(defaultRecordingPrefs, getMainWindow);
 
 	ipcMain.handle("request-camera-access", async () => {
 		if (process.platform !== "darwin") {
@@ -1797,14 +1996,27 @@ export function registerIpcHandlers(
 	ipcMain.handle("request-native-mac-cursor-access", async () => {
 		const access = await requestMacCursorAccessibilityAccess();
 
-		// When the editable cursor can't get Accessibility trust, pop a native dialog
-		// that deep-links to the Accessibility pane (mirrors the Screen Recording flow).
+		// Pop the native Accessibility dialog ONLY for a genuine denial — the helper ran,
+		// asked, and was told no. Every other !granted status means the helper never got
+		// to ask (absent from the build, killed by the loader, crashed, hung), and telling
+		// the user to grant a permission they may well already hold is what made #515
+		// impossible to escape. Those degrade silently instead; the recorder falls back to
+		// position-only cursor telemetry and the countdown still runs.
 		if (process.platform === "darwin" && !access.granted) {
+			if (isMacCursorHelperUnavailable(access.status)) {
+				console.warn(
+					`[cursor-macos] editable cursor unavailable (status=${access.status}${
+						access.error ? `, error=${access.error}` : ""
+					}); the app ${
+						access.accessibilityTrusted ? "does" : "does not"
+					} hold Accessibility trust. Recording continues with position-only cursor telemetry.`,
+				);
+				return access;
+			}
+
 			const mainWin = getMainWindow();
 			const detail =
-				access.status === "missing-helper"
-					? "The cursor helper couldn't be found in this build, so the editable cursor can't be enabled. Rebuild the native helper (npm run build:native:mac) or switch the HUD cursor mode to system."
-					: "Allow OpenScreen under System Settings → Privacy & Security → Accessibility, then press record again to start the countdown.";
+				"Allow OpenScreen under System Settings → Privacy & Security → Accessibility, then press record again to start the countdown.";
 			const messageOptions = {
 				type: "warning",
 				buttons: ["Open Accessibility Settings", "Cancel"],
@@ -2304,6 +2516,11 @@ export function registerIpcHandlers(
 							null)
 						: getSelectedDisplay();
 				const bounds = sourceDisplay?.bounds ?? getSelectedSourceBounds();
+				// `bounds` is DIPs; the helper matches it against physical monitor rects
+				// (getopenscreen/openscreen#346). Converted here, at the wire, and not in
+				// `getSelectedSourceBounds` — the cursor session shares that getter and
+				// converts on its own side.
+				const helperBounds = toHelperRect(bounds);
 				const displayId =
 					typeof request.source.displayId === "number" && Number.isFinite(request.source.displayId)
 						? request.source.displayId
@@ -2332,10 +2549,10 @@ export function registerIpcHandlers(
 					fps: request.video.fps,
 					videoWidth: request.video.width,
 					videoHeight: request.video.height,
-					displayX: bounds.x,
-					displayY: bounds.y,
-					displayW: bounds.width,
-					displayH: bounds.height,
+					displayX: helperBounds.x,
+					displayY: helperBounds.y,
+					displayW: helperBounds.width,
+					displayH: helperBounds.height,
 					hasDisplayBounds: true,
 					captureSystemAudio: request.audio.system.enabled,
 					captureMic: request.audio.microphone.enabled,
@@ -2360,7 +2577,7 @@ export function registerIpcHandlers(
 						sourceId: request.source.sourceId,
 						displayId: Number.isFinite(displayId) ? displayId : null,
 						windowHandle: request.source.windowHandle ?? null,
-						bounds,
+						bounds: helperBounds,
 					},
 					video: request.video,
 					audio: request.audio,
@@ -2377,7 +2594,10 @@ export function registerIpcHandlers(
 					webcam: request.webcam,
 					encoder: { preferSoftwareEncoder },
 					cursor: { mode: cursorCaptureMode },
-					bounds,
+					// Both spaces, deliberately: the helper's own errors quote the physical
+					// rect, and a report that only carried the DIP one would be read against
+					// numbers it never saw (getopenscreen/openscreen#346).
+					bounds: { dip: bounds, helper: helperBounds },
 					sourceId: selectedSource?.id ?? null,
 					usedDisplayMatch: Boolean(sourceDisplay),
 					outputPath,
@@ -2422,8 +2642,11 @@ export function registerIpcHandlers(
 					cursorCaptureMode === "editable-overlay"
 						? Math.max(0, captureStartedAtMs - cursorStartTimeMs)
 						: 0;
-				const webcamFormat = readNativeWindowsWebcamFormat(nativeWindowsCaptureOutput);
+				const webcamFormat = readWebcamFormat(nativeWindowsCaptureOutput);
 				const encoderSelection = readNativeWindowsEncoderSelection(nativeWindowsCaptureOutput);
+				// Captured now because stop may have no helper left to ask. A helper
+				// killed mid-recording is exactly the case where this matters most.
+				nativeWindowsCaptureContainer = encoderSelection?.container ?? null;
 				console.info("[native-wgc] capture started", {
 					captureStartedAtMs,
 					cursorOffsetMs: nativeWindowsCursorOffsetMs,
@@ -2436,12 +2659,43 @@ export function registerIpcHandlers(
 					onRecordingStateChange(true, source.name);
 				}
 
+				// Reported at start, not at stop: the helper decides the camera is a
+				// lost cause during its own init — before it announces "Recording
+				// started", so the warning is already in the buffer here — and telling
+				// the user now, while the take is still worth restarting, beats telling
+				// them at the end. Keyed on the helper's own event rather than on a
+				// missing `webcamFormat`: absence of the format line also means "the
+				// line could not be parsed", which would put a red toast on a recording
+				// whose camera is working perfectly.
+				const webcamUnavailable =
+					request.webcam.enabled && readWebcamUnavailable(nativeWindowsCaptureOutput);
+				// Same shape as the camera notice: the helper records the Windows
+				// default input rather than failing, so this take is usable but is
+				// almost certainly the wrong microphone.
+				const microphoneDefaulted =
+					request.audio.microphone.enabled && readMicrophoneDefaulted(nativeWindowsCaptureOutput);
+				if (microphoneDefaulted) {
+					console.warn("[native-wgc] recording the default input; the microphone was not named", {
+						deviceId: request.audio.microphone.deviceId,
+						deviceName: request.audio.microphone.deviceName,
+					});
+				}
+				if (webcamUnavailable) {
+					console.warn("[native-wgc] recording without a camera; the helper could not open it", {
+						deviceId: request.webcam.deviceId,
+						deviceName: request.webcam.deviceName,
+					});
+				}
+
 				return {
 					success: true,
 					recordingId,
 					path: outputPath,
 					helperPath,
 					videoEncoderSelection: encoderSelection?.video ?? null,
+					videoEncoderRuntime: encoderSelection?.videoEncoderRuntime ?? null,
+					webcamUnavailable,
+					microphoneDefaulted,
 				};
 			} catch (error) {
 				console.error("Failed to start native Windows recording:", error);
@@ -2499,10 +2753,19 @@ export function registerIpcHandlers(
 						null)
 					: getSelectedDisplay();
 			const bounds = request.source.bounds ?? sourceDisplay?.bounds ?? getSelectedSourceBounds();
+			const captureExcludedWindowSourceIds: string[] = [];
+			if (request.source.type === "display") {
+				for (const window of [getMainWindow(), getNotesWindow()]) {
+					if (window && !window.isDestroyed()) {
+						captureExcludedWindowSourceIds.push(window.getMediaSourceId());
+					}
+				}
+			}
 			const config: NativeMacRecordingRequest = {
 				...request,
 				schemaVersion: 1,
 				recordingId,
+				excludedWindowIds: collectMacCaptureExcludedWindowIds(captureExcludedWindowSourceIds),
 				source: {
 					...request.source,
 					bounds,
@@ -2530,6 +2793,7 @@ export function registerIpcHandlers(
 			console.info("[native-sck] starting macOS capture", {
 				helperPath,
 				source: config.source,
+				excludedWindowIds: config.excludedWindowIds,
 				audio: config.audio,
 				webcam: config.webcam,
 				cursor: config.cursor,
@@ -2565,6 +2829,14 @@ export function registerIpcHandlers(
 
 			await waitForNativeMacCaptureStart(proc);
 			const captureStartedAtMs = Date.now();
+			const microphoneDefaulted =
+				request.audio.microphone.enabled && readMicrophoneDefaulted(nativeMacCaptureOutput);
+			if (microphoneDefaulted) {
+				console.warn("[native-sck] recording the default input; microphone was not resolved", {
+					deviceId: request.audio.microphone.deviceId,
+					deviceName: request.audio.microphone.deviceName,
+				});
+			}
 			nativeMacCursorOffsetMs =
 				cursorCaptureMode === "editable-overlay"
 					? Math.max(0, captureStartedAtMs - cursorStartTimeMs)
@@ -2580,6 +2852,7 @@ export function registerIpcHandlers(
 				recordingId,
 				path: outputPath,
 				helperPath,
+				microphoneDefaulted,
 			};
 		} catch (error) {
 			console.error("Failed to start native macOS recording:", error);
@@ -2733,6 +3006,11 @@ export function registerIpcHandlers(
 			}
 		}
 
+		// Set when the helper failed its stop handshake but left a playable
+		// fragmented file. Reported so a bug report can tell a clean stop from a
+		// recovered one; the user-facing path is deliberately identical.
+		let recovered = false;
+
 		try {
 			completeNativeWindowsCursorPauseRange();
 			const stopPromise = waitForNativeWindowsCaptureStop({
@@ -2754,35 +3032,62 @@ export function registerIpcHandlers(
 				if (!stopResult.exited) {
 					detachNativeWindowsCaptureOutputDrain();
 				}
-				await stopCursorRecording();
-				// Same as the discard path. `startCursorRecording` clears this on
-				// the next recording anyway, so this is not what keeps the samples
-				// from being written next to someone else's video -- it just stops
-				// a lost take's telemetry from sitting in memory until then.
-				pendingCursorRecordingData = null;
-				// The helper never announced a finalized file, so what is on disk
-				// is almost certainly an unindexed stub, and leaving those behind
-				// just accumulates unplayable recordings the user cannot explain.
-				// Almost: size-gate it, because throwing away a recording to tidy
-				// up after a failed stop is the worse mistake of the two.
-				await removeNativeWindowsCaptureOutputs(preferredPath, preferredWebcamPath, {
-					onlyIfUnusable: true,
-				});
-				// The helper log goes to console/diagnostics above, not into this
-				// string: it ends up in a toast, and pasting an entire capture log
-				// into the HUD tells the user nothing they can act on.
-				return {
-					success: false,
-					reason: stopResult.reason,
-					error:
-						stopResult.reason === "stop-timeout"
-							? "Timed out waiting for native Windows capture to stop. The recording could not be saved."
-							: stopResult.message.split(/\r?\n/).filter(Boolean).at(-1) ||
-								"Native Windows capture failed.",
-				};
+
+				// A failed stop stopped meaning a lost take when the helper started
+				// writing fragmented MP4. The file on disk is already playable, so
+				// the only thing standing between the user and their recording is
+				// this function deciding to throw it away and say so. Fall through
+				// into the normal save path instead: same manifest, same media
+				// links, same editor. From the user's side it simply worked, minus
+				// at most the last incomplete fragment.
+				//
+				// Only once the helper is actually dead. `exited: false` means it
+				// survived even the forced kill -- stuck somewhere `TerminateProcess`
+				// could not reach -- and on Windows such a process still holds the
+				// MP4 open and may still be appending to it. Handing that file to
+				// the editor trades an honest failure for a sharing violation on a
+				// file that is still moving, so a wedged helper keeps the old answer.
+				if (stopResult.exited && (await salvageNativeWindowsFragmentedCapture(preferredPath))) {
+					console.warn("[native-wgc] stop failed but the fragmented output is playable", {
+						reason: stopResult.reason,
+						path: preferredPath,
+					});
+					recovered = true;
+				} else {
+					await stopCursorRecording();
+					// Same as the discard path. `startCursorRecording` clears this on
+					// the next recording anyway, so this is not what keeps the samples
+					// from being written next to someone else's video -- it just stops
+					// a lost take's telemetry from sitting in memory until then.
+					pendingCursorRecordingData = null;
+					// Reaching here means the container was the plain one, whose only
+					// index is written by the `Finalize()` this stop never reached, so
+					// what is on disk really is an unindexed stub and leaving those
+					// behind just accumulates unplayable recordings the user cannot
+					// explain. Size-gate it anyway: throwing away a recording to tidy
+					// up after a failed stop is the worse mistake of the two, and the
+					// gate is the same one the salvage check above uses.
+					await removeNativeWindowsCaptureOutputs(preferredPath, preferredWebcamPath, {
+						onlyIfUnusable: true,
+					});
+					// The helper log goes to console/diagnostics above, not into this
+					// string: it ends up in a toast, and pasting an entire capture log
+					// into the HUD tells the user nothing they can act on.
+					return {
+						success: false,
+						reason: stopResult.reason,
+						error:
+							stopResult.reason === "stop-timeout"
+								? "Timed out waiting for native Windows capture to stop. The recording could not be saved."
+								: stopResult.message.split(/\r?\n/).filter(Boolean).at(-1) ||
+									"Native Windows capture failed.",
+					};
+				}
 			}
 
-			const screenVideoPath = stopResult.screenVideoPath || preferredPath;
+			// Only a successful stop names the file; the salvage path above falls
+			// through with `ok: false` and nothing but the path we asked for.
+			const screenVideoPath = (stopResult.ok ? stopResult.screenVideoPath : null) || preferredPath;
 			if (!screenVideoPath) {
 				throw new Error("Native Windows capture did not return an output path.");
 			}
@@ -2801,8 +3106,21 @@ export function registerIpcHandlers(
 			let webcamVideoPath: string | undefined;
 			if (preferredWebcamPath) {
 				try {
-					await fs.access(preferredWebcamPath, fsConstants.R_OK);
-					webcamVideoPath = preferredWebcamPath;
+					// Size, not just existence. A camera that opened but delivered no
+					// frame still gets a file created for it, and its `Finalize()` then
+					// fails, leaving nought bytes on disk. Admitting that file put a
+					// camera track in the document pointing at something no demuxer can
+					// read, and the preview compositor answers an unreadable camera by
+					// drawing the SCREEN recording inside the little camera rectangle —
+					// which is how a webcam that never recorded showed up as the desktop
+					// duplicated into its own corner (getopenscreen/openscreen#387).
+					const webcamStat = await fs.stat(preferredWebcamPath);
+					webcamVideoPath = webcamStat.size > 0 ? preferredWebcamPath : undefined;
+					if (!webcamVideoPath) {
+						console.warn("[native-wgc] the webcam file is empty; saving without a camera", {
+							path: preferredWebcamPath,
+						});
+					}
 				} catch {
 					webcamVideoPath = undefined;
 				}
@@ -2824,7 +3142,18 @@ export function registerIpcHandlers(
 				success: true,
 				path: screenVideoPath,
 				session,
-				message: "Native Windows recording session stored successfully",
+				recovered,
+				// `preferredWebcamPath` is non-null only for a take that asked for a
+				// camera, so the pair means "a camera was requested and none survived".
+				// This is the second, quieter way to lose one: the helper opened the
+				// device happily and then never got a frame out of it, so it reports no
+				// `webcam-unavailable` and the start-time notice stays silent. Left
+				// unreported, the user would find out in the editor — which is exactly
+				// the silence this change exists to end.
+				webcamDropped: Boolean(preferredWebcamPath) && !webcamVideoPath,
+				message: recovered
+					? "Native Windows recording recovered from a failed stop"
+					: "Native Windows recording session stored successfully",
 			};
 		} catch (error) {
 			console.error("Failed to stop native Windows recording:", error);
@@ -3157,10 +3486,15 @@ export function registerIpcHandlers(
 					...(cursorCaptureMode ? { cursorCaptureMode } : {}),
 				}
 			: { screenVideoPath, createdAt, ...(cursorCaptureMode ? { cursorCaptureMode } : {}) };
+		// Sidecar BEFORE the session is published, as the three native stop paths already
+		// do it. Publishing first opens a window where `getCurrentRecordingSession` hands
+		// the editor a take whose `.cursor.json` is not on disk yet, and the editor's
+		// fresh-take auto-zoom reads that file the moment it imports -- an empty read there
+		// is indistinguishable from a take with no dwell, so the zooms are silently
+		// skipped.
+		await writePendingCursorTelemetry(screenVideoPath);
 		setCurrentRecordingSessionState(session);
 		currentProjectPath = null;
-
-		await writePendingCursorTelemetry(screenVideoPath);
 
 		const sessionManifestPath = path.join(
 			RECORDINGS_DIR,
@@ -3360,6 +3694,8 @@ export function registerIpcHandlers(
 		}
 	});
 
+	// The media tab imports VIDEO (it arranges clips). Audio is imported from the
+	// timeline toolbar instead (issue #350) — see `open-audio-file-picker` below.
 	ipcMain.handle("open-video-file-picker", async () => {
 		try {
 			const dialogOptions = buildDialogOptions(
@@ -3406,6 +3742,84 @@ export function registerIpcHandlers(
 		}
 	});
 
+	// Import an external audio file (voiceover / BGM / SFX) — issue #350. Driven by
+	// the timeline's "Add audio" tool: audio is a timeline overlay (like an
+	// annotation), not a media-tab clip, so it has its own audio-only picker and the
+	// renderer adds it as a kind:"audio" asset + track at the playhead.
+	ipcMain.handle("open-audio-file-picker", async () => {
+		try {
+			const dialogOptions = buildDialogOptions(
+				{
+					title: mainT("dialogs", "fileDialogs.selectAudio"),
+					defaultPath: RECORDINGS_DIR,
+					filters: [
+						{
+							name: mainT("dialogs", "fileDialogs.audioFiles"),
+							extensions: ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"],
+						},
+						{ name: mainT("dialogs", "fileDialogs.allFiles"), extensions: ["*"] },
+					],
+					properties: ["openFile"],
+				},
+				getMainWindow(),
+			);
+			const result = await dialog.showOpenDialog(dialogOptions);
+
+			if (result.canceled || result.filePaths.length === 0) {
+				return { success: false, canceled: true };
+			}
+
+			const normalizedPath = await approveReadableAudioPath(result.filePaths[0]);
+			if (!normalizedPath) {
+				return {
+					success: false,
+					message: "Selected file is not a supported readable audio file",
+				};
+			}
+
+			return {
+				success: true,
+				path: normalizedPath,
+			};
+		} catch (error) {
+			console.error("Failed to open audio file picker:", error);
+			return {
+				success: false,
+				message: "Failed to open audio file picker",
+				error: String(error),
+			};
+		}
+	});
+
+	// In-editor voiceover recording: the renderer hands over the raw MediaRecorder
+	// blob (webm/opus) and gets back the path it landed at, under the recordings
+	// dir so it lives with the project's other media and survives relaunches.
+	ipcMain.handle("save-recorded-voiceover", async (_event, data: ArrayBuffer) => {
+		try {
+			if (!(data instanceof ArrayBuffer) || data.byteLength === 0) {
+				return { success: false, message: "Empty recording" };
+			}
+			// A cap, because this writes renderer-supplied bytes straight to disk. An
+			// hour of Opus is a few tens of MB, so 512 MB is far past any real take
+			// and still refuses a runaway or malformed payload before it is buffered.
+			if (data.byteLength > MAX_RECORDED_VOICEOVER_BYTES) {
+				return { success: false, message: "Recording too large" };
+			}
+			await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+			const fileName = `voiceover-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+			const target = path.join(RECORDINGS_DIR, fileName);
+			await fs.writeFile(target, Buffer.from(data));
+			return { success: true, path: target };
+		} catch (error) {
+			console.error("Failed to save recorded voiceover:", error);
+			return {
+				success: false,
+				message: "Failed to save recorded voiceover",
+				error: String(error),
+			};
+		}
+	});
+
 	ipcMain.handle("reveal-in-folder", async (_, filePath: string) => {
 		try {
 			// showItemInFolder returns nothing, it throws on error
@@ -3431,7 +3845,7 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("read-binary-file", async (_, filePath: string) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -3461,7 +3875,7 @@ export function registerIpcHandlers(
 	// recording above that can never be loaded whole — see read-file-chunk).
 	ipcMain.handle("get-readable-file-info", async (_, filePath: string) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -3497,7 +3911,7 @@ export function registerIpcHandlers(
 		async (_, filePath: string, durationSec: number): Promise<AudioPeaksResult> => {
 			try {
 				// Same approval gate as every other read of a renderer-supplied path.
-				const normalizedPath = await approveReadableVideoPath(filePath);
+				const normalizedPath = readableApprovedPath(filePath);
 				if (!normalizedPath) {
 					return { success: false, message: "File path is not approved" };
 				}
@@ -3521,7 +3935,7 @@ export function registerIpcHandlers(
 	// do (2 GiB cap) and a 16 GB machine cannot hold for multi-GB recordings.
 	ipcMain.handle("read-file-chunk", async (_, filePath: string, offset: number, length: number) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -3938,51 +4352,8 @@ export function registerIpcHandlers(
 
 	ipcMain.handle(
 		"save-diagnostic",
-		async (
-			_,
-			payload: { error: string; stack?: string; projectState: unknown; logs: string[] },
-		) => {
-			const { filePath, canceled } = await dialog.showSaveDialog({
-				title: "Save Diagnostic File",
-				defaultPath: `openscreen-diagnostic-${Date.now()}.json`,
-				filters: [{ name: "JSON", extensions: ["json"] }],
-			});
-
-			if (canceled || !filePath) return { success: false, canceled: true };
-
-			const HELPER_OUTPUT_MAX_BYTES = 64 * 1024;
-			const tail = (s: string, max: number) => (s.length <= max ? s : s.slice(s.length - max));
-
-			const diagnostic = {
-				timestamp: new Date().toISOString(),
-				appVersion: app.getVersion(),
-				platform: process.platform,
-				arch: process.arch,
-				osRelease: os.release(),
-				osVersion: os.version(),
-				totalMemoryMB: Math.round(os.totalmem() / 1024 / 1024),
-				nodeVersion: process.versions.node,
-				electronVersion: process.versions.electron,
-				chromeVersion: process.versions.chrome,
-				error: payload.error,
-				stack: payload.stack,
-				projectState: payload.projectState,
-				recentLogs: payload.logs,
-				helperOutput: {
-					windows: tail(nativeWindowsCaptureOutput, HELPER_OUTPUT_MAX_BYTES),
-					mac: tail(nativeMacCaptureOutput, HELPER_OUTPUT_MAX_BYTES),
-				},
-				mainProcessLogs: mainLogBuffer.snapshot(),
-			};
-
-			try {
-				await fs.writeFile(filePath, JSON.stringify(diagnostic, null, 2), "utf-8");
-				return { success: true, path: filePath };
-			} catch (error) {
-				console.error("Failed to write diagnostic file:", error);
-				return { success: false, error: String(error) };
-			}
-		},
+		async (_, payload: { error: string; stack?: string; projectState: unknown; logs: string[] }) =>
+			exportDiagnosticFile(payload),
 	);
 
 	// One instance each, not one per call. DocumentService serialises saves of a
@@ -3993,6 +4364,7 @@ export function registerIpcHandlers(
 	const aiEditionDocuments = new DocumentService(
 		path.join(app.getPath("userData"), "projects"),
 		RECORDINGS_DIR,
+		approveDocumentMedia,
 	);
 
 	// LlmConfigStore is single-instance for a duller reason — its constructor does

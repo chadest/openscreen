@@ -34,7 +34,9 @@ import { useScopedT } from "@/contexts/I18nContext";
 import { resolveAspectRatioValue } from "@/lib/ai-edition/document/outputFormat";
 import type {
 	AxcutAnnotationRegion,
+	AxcutAudioTrack,
 	AxcutClip,
+	AxcutTranscript,
 	AxcutTrimRange,
 	AxcutZoomRegion,
 } from "@/lib/ai-edition/schema";
@@ -47,6 +49,7 @@ import { locateVirtualPosition } from "@/lib/ai-edition/timeline/virtual-preview
 import {
 	computeCameraFullscreenRect,
 	computeCompositeLayout,
+	resolveWebcamLayoutPreset,
 	type WebcamCompositeLayout,
 } from "@/lib/compositeLayout";
 import { classifyWallpaper, resolveImageWallpaperUrl } from "@/lib/wallpaper";
@@ -64,11 +67,17 @@ type BlurData = NonNullable<AxcutAnnotationRegion["blurData"]>;
 
 interface PreviewCanvasProps {
 	videoSources: VideoSource[];
+	/** Imported audio tracks + their asset URLs (issue #350), forwarded to
+	 *  VirtualPreview. */
+	audioTracks?: AxcutAudioTrack[];
+	audioSources?: VideoSource[];
 	clips: AxcutClip[];
 	zoomRegions?: AxcutZoomRegion[];
 	speedRegions?: SpeedRegion[];
 	cameraFullscreenRegions?: CameraFullscreenRegion[];
 	trimRanges?: AxcutTrimRange[];
+	/** Relayed to `VirtualPreview` so a clip carrying added words plays their extensions. */
+	transcripts?: AxcutTranscript[];
 	selectedZoomRegionId?: string | null;
 	onZoomFocusChange?: (id: string, focus: ZoomFocus) => void;
 	onZoomFocusCommit?: () => void;
@@ -85,9 +94,14 @@ interface PreviewCanvasProps {
 	onLoadedMetadata: (sec: number, assetId: string) => void;
 	onVideoElement: (el: HTMLVideoElement | null) => void;
 	currentTimeSec: number;
-	/** Receives the id of the asset whose <video> failed — the caller decides per
-	 *  source whether anything is left to render (see Preview.tsx). */
-	onVideoError?: (assetId: string) => void;
+	/** Receives the id of the asset whose <video> gave up, plus the MediaError
+	 *  detail for the card. Transient failures are reloaded inside VirtualPreview
+	 *  and never reach here (see Preview.tsx). */
+	onVideoError?: (assetId: string, detail: string) => void;
+	/** The mounted source decoded a frame again — see VirtualPreview. */
+	onVideoRecovered?: (assetId: string) => void;
+	/** Bumped to force a reload of the mounted source (the Retry button). */
+	retryToken?: number;
 }
 
 // ponytail: fallback only — used until the active source's <video> reports
@@ -226,9 +240,10 @@ export function PreviewCanvas(props: PreviewCanvasProps) {
 		// A clip with no camera lays out as "no-webcam", whatever the panel says. Hiding
 		// only the webcam slot is not enough: the block presets size the SCREEN off the
 		// block, so the screen stayed squeezed into its half with nothing beside it.
-		const preset = (
-			activeClipHasCamera ? settings.webcamLayoutPreset : "no-webcam"
-		) as WebcamLayoutPreset;
+		const preset = resolveWebcamLayoutPreset(
+			settings.webcamLayoutPreset as WebcamLayoutPreset,
+			activeClipHasCamera,
+		);
 		const mask = settings.webcamMaskShape as WebcamMaskShape;
 		// ponytail: padding shrinks the available content area for ALL layouts
 		// (PiP/dual/stack) so the screen doesn't fill the canvas edge-to-edge.
